@@ -2,8 +2,10 @@ package com.bloodcheck.app
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.lang.reflect.Method
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.util.Collections
@@ -187,6 +189,52 @@ class BleSpectrumBatcherTest {
         assertEquals(1L, batcher.lastFlushedIndex)
     }
 
+    @Test
+    fun interruptedOrderedWriteWaitFailsLaterCallersInsteadOfStrandingThem() {
+        val file = File(tempDir("ble-spectrum-batcher"), "spectrum.csv")
+        val writes = Collections.synchronizedList(mutableListOf<Long>())
+        val batcher = BleSpectrumBatcher(
+            spectrumFile = file,
+            sessionId = "session-interrupted",
+            initialSampleIndex = 0,
+            batchSize = 1,
+            appendSamples = { _, samples -> writes.add(samples.first().sampleIndex) }
+        )
+        val writeBatch = privateWriteBatchMethod()
+        val waitingBatch = pendingBatch(sequence = 2, sampleIndex = 2)
+        val laterBatch = pendingBatch(sequence = 3, sampleIndex = 3)
+        val waitingThreadStarted = CountDownLatch(1)
+        val waitingThreadError = AtomicReference<Throwable?>()
+        val laterThreadError = AtomicReference<Throwable?>()
+
+        val waitingThread = Thread {
+            waitingThreadStarted.countDown()
+            captureThreadError(waitingThreadError) {
+                writeBatch.invoke(batcher, waitingBatch)
+            }
+        }
+
+        waitingThread.start()
+        assertTrue(waitingThreadStarted.await(5, TimeUnit.SECONDS))
+        Thread.sleep(100)
+
+        waitingThread.interrupt()
+        waitingThread.join(5_000)
+
+        val laterThread = Thread {
+            captureThreadError(laterThreadError) {
+                writeBatch.invoke(batcher, laterBatch)
+            }
+        }
+        laterThread.start()
+        laterThread.join(1_000)
+
+        assertFalse(laterThread.isAlive)
+        assertTrue(waitingThreadError.get() is java.lang.reflect.InvocationTargetException)
+        assertTrue(laterThreadError.get() is java.lang.reflect.InvocationTargetException)
+        assertEquals(emptyList<Long>(), writes.toList())
+    }
+
     private fun assertTrueContains(actual: String, expectedSubstring: String) {
         org.junit.Assert.assertTrue("$actual should contain $expectedSubstring", actual.contains(expectedSubstring))
     }
@@ -197,6 +245,23 @@ class BleSpectrumBatcherTest {
         } catch (throwable: Throwable) {
             error.compareAndSet(null, throwable)
         }
+    }
+
+    private fun privateWriteBatchMethod(): Method {
+        val pendingBatchClass = Class.forName("com.bloodcheck.app.BleSpectrumBatcher\$PendingBatch")
+        return BleSpectrumBatcher::class.java.getDeclaredMethod("writeBatch", pendingBatchClass).also {
+            it.isAccessible = true
+        }
+    }
+
+    private fun pendingBatch(sequence: Long, sampleIndex: Long): Any {
+        val pendingBatchClass = Class.forName("com.bloodcheck.app.BleSpectrumBatcher\$PendingBatch")
+        val constructor = pendingBatchClass.getDeclaredConstructor(Long::class.javaPrimitiveType, List::class.java)
+        constructor.isAccessible = true
+        return constructor.newInstance(
+            sequence,
+            listOf(BleRawSample(sampleIndex, "session-interrupted", 1000L, 1, 2, 3, 4.0, 5.0))
+        )
     }
 
     private fun tempDir(prefix: String): File = Files.createTempDirectory(prefix).toFile()

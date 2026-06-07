@@ -134,7 +134,10 @@ class BleSpectrumBatcher private constructor(
                     writeLock.wait()
                 } catch (exception: InterruptedException) {
                     Thread.currentThread().interrupt()
-                    throw IllegalStateException("Interrupted while waiting to write spectrum batch", exception)
+                    val failure = IllegalStateException("Interrupted while waiting to write spectrum batch", exception)
+                    writeFailure = failure
+                    writeLock.notifyAll()
+                    throw failure
                 }
                 throwIfWriteFailedLocked()
             }

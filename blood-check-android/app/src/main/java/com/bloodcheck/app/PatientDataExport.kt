@@ -14,7 +14,7 @@ import java.nio.charset.StandardCharsets
  */
 object PatientDataExport {
 
-    private val EXPORT_HEADERS = listOf(
+    val EXPORT_HEADERS = listOf(
         "时间",
         "患者ID",
         "统一ID",
@@ -45,6 +45,10 @@ object PatientDataExport {
             list.add(formatOneRecord(rec))
         }
         return list
+    }
+
+    fun formatOneRecordForExport(record: JSONObject): Map<String, String> {
+        return formatOneRecord(record)
     }
 
     private fun formatOneRecord(record: JSONObject): Map<String, String> {

@@ -441,13 +441,14 @@ class BleMonitorManager(
             return
         }
 
-        val now = SystemClock.elapsedRealtime()
+        val nowElapsedMillis = SystemClock.elapsedRealtime()
+        val capturedAtMillis = System.currentTimeMillis()
         var shouldLogWarmupDrop = false
         val stableElapsedMillis = synchronized(collectionStateLock) {
             if (firstDataElapsedMs == 0L) {
-                firstDataElapsedMs = now
+                firstDataElapsedMs = nowElapsedMillis
             }
-            val elapsedMillis = now - firstDataElapsedMs - collectionWarmupMillis
+            val elapsedMillis = nowElapsedMillis - firstDataElapsedMs - collectionWarmupMillis
             if (elapsedMillis < 0L && !warmupLogged) {
                 warmupLogged = true
                 shouldLogWarmupDrop = true
@@ -465,7 +466,7 @@ class BleMonitorManager(
         parsed.forEach { values ->
             count = signalBuffer.add(values)
         }
-        onRawSamplesCallback(parsed, now)
+        onRawSamplesCallback(parsed, capturedAtMillis)
         if (count <= 5 || count % 50 == 0) {
             Log.i(TAG, "parsedSamples=$count stableElapsedMs=$stableElapsedMillis last=${parsed.last()}")
         }

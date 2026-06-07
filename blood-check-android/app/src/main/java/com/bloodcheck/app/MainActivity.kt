@@ -138,11 +138,23 @@ class MainActivity : AppCompatActivity() {
             scheduleNextMonitorPoll()
             return@Runnable
         }
-        pendingInferenceSpectrumRange = activeMonitorFileSession
-            ?.takeIf { it.patientId == id }
-            ?.batcher
-            ?.currentRange()
-        viewModel.predictLiveForMonitoring(id, snapshot.red, snapshot.infrared)
+        val redSnapshot = snapshot.red
+        val infraredSnapshot = snapshot.infrared
+        submitMonitorFileIo(
+            errorMessage = "监测文件状态读取失败",
+            disableWritesOnFailure = false,
+            skipWhenFileWritesDisabled = false
+        ) {
+            val spectrumRange = activeMonitorFileSession
+                ?.takeIf { it.patientId == id }
+                ?.batcher
+                ?.currentRange()
+            handler.post {
+                if (!isMonitoring || currentPatientId() != id) return@post
+                pendingInferenceSpectrumRange = spectrumRange
+                viewModel.predictLiveForMonitoring(id, redSnapshot, infraredSnapshot)
+            }
+        }
     }
 
     private var isMonitoring: Boolean = false
@@ -164,6 +176,8 @@ class MainActivity : AppCompatActivity() {
     }
     private val patientRecordCsvWriter = PatientRecordCsvWriter()
     @Volatile private var activeMonitorFileSession: MonitorFileSession? = null
+    @Volatile private var monitorFileWritesDisabled: Boolean = false
+    @Volatile private var lastMonitorFileIoToastAtMillis: Long = 0L
     private var pendingInferenceSpectrumRange: BleSpectrumRange? = null
 
     private val hbSeries = mutableListOf<ChartPoint>()
@@ -376,12 +390,15 @@ class MainActivity : AppCompatActivity() {
         updateHasPatientIdUi()
 
         isMonitoring = true
-        rebuildMonitorFileSessionForCurrentPatient(id)
         liveMonitorGate.reset()
         handler.removeCallbacks(monitorPollRunnable)
         updateMonitoringUi()
 
-        startBleMonitoring()
+        rebuildMonitorFileSessionForCurrentPatient(id) {
+            if (isMonitoring && currentPatientId() == id) {
+                startBleMonitoring()
+            }
+        }
     }
 
     private fun scheduleNextMonitorPoll() {
@@ -418,28 +435,41 @@ class MainActivity : AppCompatActivity() {
         handler.postDelayed(bleStatusRetryRunnable, BLE_STATUS_RETRY_MILLIS)
     }
 
-    private fun rebuildMonitorFileSessionForCurrentPatient(patientId: String) {
+    private fun rebuildMonitorFileSessionForCurrentPatient(patientId: String, onReady: () -> Unit) {
         val profile = PatientDataStorage.loadLocalCollectProfile(this)
         val patientName = profile.name
         val previousSession = activeMonitorFileSession
         activeMonitorFileSession = null
         pendingInferenceSpectrumRange = null
 
-        submitMonitorFileIo("患者数据文件初始化失败") {
-            previousSession?.batcher?.flush()
+        submitMonitorFileIo(
+            errorMessage = "患者数据文件初始化失败",
+            skipWhenFileWritesDisabled = false
+        ) {
+            try {
+                if (!monitorFileWritesDisabled) {
+                    previousSession?.batcher?.flush()
 
-            val patientDir = patientDataFileStore.patientDirectory(patientName, patientId)
-            val spectrumFile = patientDataFileStore.spectrumFile(patientDir)
-            val initialSampleIndex = MonitorSpectrumFileIndex.nextSampleIndex(spectrumFile)
-            activeMonitorFileSession = MonitorFileSession(
-                patientId = patientId,
-                recordsFile = patientDataFileStore.recordsFile(patientDir),
-                batcher = BleSpectrumBatcher(
-                    spectrumFile = spectrumFile,
-                    sessionId = UUID.randomUUID().toString(),
-                    initialSampleIndex = initialSampleIndex
-                )
-            )
+                    val patientDir = patientDataFileStore.patientDirectory(patientName, patientId)
+                    val spectrumFile = patientDataFileStore.spectrumFile(patientDir)
+                    val initialSampleIndex = MonitorSpectrumFileIndex.nextSampleIndex(spectrumFile)
+                    activeMonitorFileSession = MonitorFileSession(
+                        patientId = patientId,
+                        recordsFile = patientDataFileStore.recordsFile(patientDir),
+                        batcher = BleSpectrumBatcher(
+                            spectrumFile = spectrumFile,
+                            sessionId = UUID.randomUUID().toString(),
+                            initialSampleIndex = initialSampleIndex
+                        )
+                    )
+                }
+            } finally {
+                handler.post {
+                    if (isMonitoring && currentPatientId() == patientId) {
+                        onReady()
+                    }
+                }
+            }
         }
     }
 
@@ -454,29 +484,57 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun flushActiveMonitorSpectrumAsync(clearSession: Boolean) {
-        val sessionToFlush = activeMonitorFileSession ?: return
-        submitMonitorFileIo("光谱数据写入失败") {
-            sessionToFlush.batcher.flush()
-            if (clearSession && activeMonitorFileSession === sessionToFlush) {
-                activeMonitorFileSession = null
+        submitMonitorFileIo(
+            errorMessage = "光谱数据写入失败",
+            skipWhenFileWritesDisabled = false
+        ) {
+            val sessionToFlush = activeMonitorFileSession
+            try {
+                if (!monitorFileWritesDisabled) {
+                    sessionToFlush?.batcher?.flush()
+                }
+            } finally {
+                if (clearSession && activeMonitorFileSession === sessionToFlush) {
+                    activeMonitorFileSession = null
+                }
             }
         }
     }
 
-    private fun submitMonitorFileIo(errorMessage: String, block: () -> Unit) {
+    private fun submitMonitorFileIo(
+        errorMessage: String,
+        disableWritesOnFailure: Boolean = true,
+        skipWhenFileWritesDisabled: Boolean = true,
+        block: () -> Unit
+    ) {
         try {
             monitorFileExecutor.execute {
+                if (skipWhenFileWritesDisabled && monitorFileWritesDisabled) {
+                    return@execute
+                }
                 try {
                     block()
                 } catch (throwable: Throwable) {
-                    Log.w(TAG, errorMessage, throwable)
-                    handler.post {
-                        Toast.makeText(applicationContext, errorMessage, Toast.LENGTH_SHORT).show()
+                    if (disableWritesOnFailure) {
+                        monitorFileWritesDisabled = true
                     }
+                    Log.w(TAG, errorMessage, throwable)
+                    postMonitorFileIoFailureToast(errorMessage)
                 }
             }
         } catch (exception: RejectedExecutionException) {
             Log.w(TAG, "monitor file executor rejected task", exception)
+        }
+    }
+
+    private fun postMonitorFileIoFailureToast(message: String) {
+        val now = System.currentTimeMillis()
+        if (!MonitorFileIoFailurePolicy.shouldShowToast(now, lastMonitorFileIoToastAtMillis)) {
+            return
+        }
+        lastMonitorFileIoToastAtMillis = now
+        handler.post {
+            Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -1437,6 +1495,14 @@ internal object MonitorSpectrumFileIndex {
             index += 1
         }
         return null
+    }
+}
+
+internal object MonitorFileIoFailurePolicy {
+    private const val TOAST_BACKOFF_MILLIS = 10_000L
+
+    fun shouldShowToast(nowMillis: Long, lastToastMillis: Long): Boolean {
+        return lastToastMillis <= 0L || nowMillis - lastToastMillis >= TOAST_BACKOFF_MILLIS
     }
 }
 

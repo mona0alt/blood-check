@@ -75,6 +75,13 @@ class PatientCsvWritersTest {
     }
 
     @Test
+    fun monitorFileIoFailurePolicyCoalescesToastWindow() {
+        assertTrue(MonitorFileIoFailurePolicy.shouldShowToast(10_000L, 0L))
+        assertFalse(MonitorFileIoFailurePolicy.shouldShowToast(15_000L, 10_000L))
+        assertTrue(MonitorFileIoFailurePolicy.shouldShowToast(20_000L, 10_000L))
+    }
+
+    @Test
     fun zipExportIncludesRecordsAndSpectrumWhenPresent() {
         val dir = tempDir("patient-zip")
         File(dir, PatientDataFileStore.RECORDS_FILE).writeText("records")

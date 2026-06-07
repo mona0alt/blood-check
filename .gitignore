@@ -1,0 +1,33 @@
+.DS_Store
+.claude/
+
+# Android / Gradle local state and build outputs
+.gradle/
+**/.gradle/
+build/
+**/build/
+local.properties
+captures/
+.idea/
+*.iml
+
+# Built install packages and signing material
+*.apk
+*.aab
+*.ap_
+**/app/release/
+*.keystore
+*.jks
+jks*
+
+# Python local environments and runtime cache
+.venv/
+.venv-*/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs and packaged desktop apps
+*.log
+*.app/

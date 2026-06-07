@@ -1,0 +1,10 @@
+numpy
+pandas
+scipy
+scikit-learn==1.8.0
+PyWavelets
+joblib
+lightgbm
+bleak
+openpyxl
+xgboost

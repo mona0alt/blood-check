@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 首页/我的滚动内容底部留白：底栏高度 + 系统手势区余量，避免最后一项贴边难滚动 -->
+    <dimen name="main_scroll_bottom_padding">100dp</dimen>
+    <!-- 「我的」信息行：标签列固定宽度，数值列左对齐 -->
+    <dimen name="mine_info_label_width">148dp</dimen>
+</resources>

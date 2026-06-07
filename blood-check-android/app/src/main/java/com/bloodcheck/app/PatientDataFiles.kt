@@ -72,8 +72,8 @@ class PatientDataFileStore(private val rootDir: File) {
                 fileCount = files.size,
                 totalBytes = files.sumOf { it.length() },
                 lastModifiedMillis = files.maxOfOrNull { it.lastModified() } ?: dir.lastModified(),
-                hasRecords = records.exists(),
-                hasSpectrum = spectrum.exists()
+                hasRecords = records.isFile,
+                hasSpectrum = spectrum.isFile
             )
         }
     }
@@ -87,7 +87,11 @@ class PatientDataFileStore(private val rootDir: File) {
                 skipped += 1
                 return@forEach
             }
-            val dir = File(root(), folder)
+            val dir = dataSetDirectoryForDelete(folder)
+            if (dir == null) {
+                failed += 1
+                return@forEach
+            }
             if (!dir.exists()) {
                 deleted += 1
             } else if (dir.isDirectory && dir.deleteRecursively()) {
@@ -102,5 +106,22 @@ class PatientDataFileStore(private val rootDir: File) {
             failed = failed,
             skippedProtected = skipped
         )
+    }
+
+    private fun dataSetDirectoryForDelete(folderName: String): File? {
+        if (folderName.isBlank() || folderName == "." || folderName == "..") {
+            return null
+        }
+        if (folderName.contains('/') || folderName.contains('\\')) {
+            return null
+        }
+
+        val canonicalRoot = root().canonicalFile
+        val target = File(canonicalRoot, folderName).canonicalFile
+        return if (target.parentFile == canonicalRoot && target.name == folderName) {
+            target
+        } else {
+            null
+        }
     }
 }

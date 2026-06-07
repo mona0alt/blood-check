@@ -38,6 +38,24 @@ class PatientDataFilesTest {
     }
 
     @Test
+    fun csvMarkerDirectoriesDoNotCountAsPatientFiles() {
+        val root = createTempDir(prefix = "patient-files")
+        val store = PatientDataFileStore(root)
+        val patientDir = store.patientDirectory("孙七", "p002")
+        patientDir.mkdirs()
+        File(patientDir, PatientDataFileStore.RECORDS_FILE).mkdir()
+        File(patientDir, PatientDataFileStore.SPECTRUM_FILE).mkdir()
+
+        val sets = store.listDataSets()
+
+        assertEquals(1, sets.size)
+        assertFalse(sets[0].hasRecords)
+        assertFalse(sets[0].hasSpectrum)
+        assertFalse(sets[0].isComplete)
+        assertEquals(0, sets[0].fileCount)
+    }
+
+    @Test
     fun deletesSelectedPatientDirectoriesButSkipsActivePatient() {
         val root = createTempDir(prefix = "patient-files")
         val store = PatientDataFileStore(root)
@@ -57,5 +75,23 @@ class PatientDataFilesTest {
         assertEquals(1, result.skippedProtected)
         assertTrue(active.exists())
         assertFalse(old.exists())
+    }
+
+    @Test
+    fun rejectsDeleteFolderNamesThatEscapeRootDirectory() {
+        val root = createTempDir(prefix = "patient-files")
+        val outside = createTempDir(prefix = "outside-patient-files")
+        val store = PatientDataFileStore(root)
+        File(outside, PatientDataFileStore.RECORDS_FILE).writeText("outside")
+
+        val result = store.deleteDataSets(
+            folderNames = listOf("../${outside.name}"),
+            protectedFolderName = null
+        )
+
+        assertEquals(1, result.failed)
+        assertEquals(0, result.deleted)
+        assertTrue(outside.exists())
+        assertTrue(File(outside, PatientDataFileStore.RECORDS_FILE).exists())
     }
 }

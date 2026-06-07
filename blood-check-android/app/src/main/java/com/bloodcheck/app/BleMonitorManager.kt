@@ -274,6 +274,22 @@ class BleMonitorManager(
         ) {
             handleNotification(value)
         }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            if (descriptor.uuid != CLIENT_CONFIG_UUID) return
+            Log.i(TAG, "notification descriptor write status=$status")
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                postConnectionStatus(BleConnectionState.CONNECTED, "蓝牙连接正常，正在采集")
+                postStatus("已开始接收实时数据")
+            } else {
+                postConnectionStatus(BleConnectionState.ERROR, "蓝牙通知描述符写入失败: $status")
+                postError("蓝牙通知描述符写入失败: $status")
+            }
+        }
     }
 
     fun beginCollecting(
@@ -388,8 +404,6 @@ class BleMonitorManager(
             postError("缺少蓝牙通知权限")
             return false
         }
-        postConnectionStatus(BleConnectionState.CONNECTED, "蓝牙连接正常，正在采集")
-        postStatus("已开始接收实时数据")
         return true
     }
 

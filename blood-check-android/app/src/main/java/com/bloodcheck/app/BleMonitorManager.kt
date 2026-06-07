@@ -44,6 +44,37 @@ data class BleSignalSnapshot(
     val size: Int get() = minOf(red.size, infrared.size)
 }
 
+data class BleRawValues(
+    val c1: Int,
+    val c2: Int,
+    val c3: Int,
+    val red: Double,
+    val infrared: Double
+)
+
+object BleRawSampleParser {
+    private val arrayRegex = Regex("""array:\s*\[([^\]]+)]""")
+    private val integerRegex = Regex("""-?\d+""")
+
+    fun parse(text: String): BleRawValues? {
+        val match = arrayRegex.find(text) ?: return null
+        val numbers = match.groupValues[1]
+            .split(",")
+            .map { it.trim() }
+            .takeIf { values -> values.size == 5 && values.all { integerRegex.matches(it) } }
+            ?.map { it.toInt() }
+            ?: return null
+
+        return BleRawValues(
+            c1 = numbers[0],
+            c2 = numbers[1],
+            c3 = numbers[2],
+            red = numbers[3].toDouble(),
+            infrared = numbers[4].toDouble()
+        )
+    }
+}
+
 class BleMonitorManager(
     private val context: Context,
     onStatus: (String) -> Unit,
@@ -52,7 +83,8 @@ class BleMonitorManager(
     mode: BleMonitorMode = BleMonitorMode.COLLECTING,
     warmupMillis: Long = 0L,
     private val scanTimeoutMillis: Long = 12_000L,
-    private val onConnectionStatus: (BleConnectionStatus) -> Unit = {}
+    private val onConnectionStatus: (BleConnectionStatus) -> Unit = {},
+    private val onRawSamples: (List<BleRawValues>, Long) -> Unit = { _, _ -> }
 ) {
     companion object {
         private const val TAG = "BloodCheckBle"
@@ -309,11 +341,11 @@ class BleMonitorManager(
         val chunk = value.toString(Charsets.UTF_8)
         synchronized(pendingText) {
             pendingText.append(chunk)
-            val parsed = mutableListOf<List<Int>>()
+            val parsed = mutableListOf<BleRawValues>()
             while (true) {
                 val text = pendingText.toString()
                 val match = Regex("""array:\s*\[([^\]]+)]""").find(text) ?: break
-                parseArray(match.value)?.let { parsed.add(it) }
+                BleRawSampleParser.parse(match.value)?.let { parsed.add(it) }
                 pendingText.delete(0, match.range.last + 1)
                 val sumIndex = pendingText.indexOf("}")
                 if (sumIndex >= 0) {
@@ -343,22 +375,17 @@ class BleMonitorManager(
             }
 
             parsed.forEach { values ->
-                redSignals.add(values[3].toDouble())
-                infraredSignals.add(values[4].toDouble())
+                redSignals.add(values.red)
+                infraredSignals.add(values.infrared)
                 trimSignals()
             }
+            onRawSamples(parsed, now)
             val count = minOf(redSignals.size, infraredSignals.size)
             if (count <= 5 || count % 50 == 0) {
                 Log.i(TAG, "parsedSamples=$count stableElapsedMs=$stableElapsedMillis last=${parsed.last()}")
             }
             mainHandler.post { onSampleCountChangedCallback(count, stableElapsedMillis) }
         }
-    }
-
-    private fun parseArray(text: String): List<Int>? {
-        val match = Regex("""array:\s*\[([^\]]+)]""").find(text) ?: return null
-        val numbers = Regex("""-?\d+""").findAll(match.groupValues[1]).map { it.value.toInt() }.toList()
-        return numbers.takeIf { it.size == 5 }
     }
 
     private fun trimSignals() {

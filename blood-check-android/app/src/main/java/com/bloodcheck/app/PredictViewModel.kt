@@ -19,9 +19,9 @@ sealed class PredictUiState {
 /** 监测轮询专用状态，不影响旧版单次预测 UI（若仍使用）。 */
 sealed class MonitorUiState {
     data object Idle : MonitorUiState()
-    data object Loading : MonitorUiState()
-    data class Success(val response: PredictionResponse) : MonitorUiState()
-    data class Error(val message: String) : MonitorUiState()
+    data class Loading(val requestId: Long? = null) : MonitorUiState()
+    data class Success(val response: PredictionResponse, val requestId: Long? = null) : MonitorUiState()
+    data class Error(val message: String, val requestId: Long? = null) : MonitorUiState()
 }
 
 class PredictViewModel(application: Application) : AndroidViewModel(application) {
@@ -76,7 +76,7 @@ class PredictViewModel(application: Application) : AndroidViewModel(application)
             return
         }
 
-        _monitorState.postValue(MonitorUiState.Loading)
+        _monitorState.postValue(MonitorUiState.Loading())
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -105,19 +105,20 @@ class PredictViewModel(application: Application) : AndroidViewModel(application)
     fun predictLiveForMonitoring(
         patientIdInput: String,
         redValues: List<Double>,
-        infraredValues: List<Double>
+        infraredValues: List<Double>,
+        requestId: Long? = null
     ) {
         val patientId = patientIdInput.trim()
         if (patientId.isEmpty()) {
-            _monitorState.postValue(MonitorUiState.Error("请输入患者ID"))
+            _monitorState.postValue(MonitorUiState.Error("请输入患者ID", requestId))
             return
         }
         if (redValues.size < 200 || infraredValues.size < 200) {
-            _monitorState.postValue(MonitorUiState.Error("实时数据不足，等待采集..."))
+            _monitorState.postValue(MonitorUiState.Error("实时数据不足，等待采集...", requestId))
             return
         }
 
-        _monitorState.postValue(MonitorUiState.Loading)
+        _monitorState.postValue(MonitorUiState.Loading(requestId))
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -129,14 +130,15 @@ class PredictViewModel(application: Application) : AndroidViewModel(application)
 
                 val response = PredictionResponse.fromJson(resultJson)
                 if (response.success && response.prediction != null) {
-                    _monitorState.postValue(MonitorUiState.Success(response))
+                    _monitorState.postValue(MonitorUiState.Success(response, requestId))
                 } else {
-                    _monitorState.postValue(MonitorUiState.Error(response.error ?: "实时推理失败"))
+                    _monitorState.postValue(MonitorUiState.Error(response.error ?: "实时推理失败", requestId))
                 }
             } catch (throwable: Throwable) {
                 _monitorState.postValue(
                     MonitorUiState.Error(
-                        throwable.message ?: "实时推理过程发生未知错误"
+                        throwable.message ?: "实时推理过程发生未知错误",
+                        requestId
                     )
                 )
             }

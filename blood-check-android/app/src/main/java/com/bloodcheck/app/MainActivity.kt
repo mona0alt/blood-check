@@ -142,7 +142,12 @@ class MainActivity : AppCompatActivity() {
         val redSnapshot = snapshot.red
         val infraredSnapshot = snapshot.infrared
         val monitorToken = activeMonitorSessionToken
+        val requestId = nextLiveInferenceRequestId()
         liveInferenceInFlight = true
+        pendingLiveInferenceRequestId = requestId
+        pendingInferencePatientId = id
+        pendingInferenceMonitorToken = monitorToken
+        pendingInferenceSpectrumRange = null
         submitMonitorFileIo(
             errorMessage = "监测文件状态读取失败",
             disableWritesOnFailure = false,
@@ -153,13 +158,17 @@ class MainActivity : AppCompatActivity() {
                 ?.batcher
                 ?.currentRange()
             handler.post {
-                if (!isActiveMonitorSession(id, monitorToken)) {
-                    clearLiveInferenceState()
+                if (
+                    !isActiveMonitorSession(id, monitorToken) ||
+                    pendingLiveInferenceRequestId != requestId
+                ) {
+                    if (pendingLiveInferenceRequestId == requestId) {
+                        clearLiveInferenceState()
+                    }
                     return@post
                 }
                 pendingInferenceSpectrumRange = spectrumRange
-                pendingInferenceMonitorToken = monitorToken
-                viewModel.predictLiveForMonitoring(id, redSnapshot, infraredSnapshot)
+                viewModel.predictLiveForMonitoring(id, redSnapshot, infraredSnapshot, requestId)
             }
         }
     }
@@ -187,6 +196,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var monitorFileWritesDisabled: Boolean = false
     @Volatile private var lastMonitorFileIoToastAtMillis: Long = 0L
     private var liveInferenceInFlight: Boolean = false
+    private var liveInferenceRequestSequence: Long = 0L
+    private var pendingLiveInferenceRequestId: Long? = null
+    private var pendingInferencePatientId: String? = null
     private var pendingInferenceSpectrumRange: BleSpectrumRange? = null
     private var pendingInferenceMonitorToken: Long? = null
 
@@ -225,19 +237,26 @@ class MainActivity : AppCompatActivity() {
         viewModel.monitorState.observe(this) { state ->
             when (state) {
                 is MonitorUiState.Success -> {
-                    onMonitorPredictionSuccess(state.response)
-                    liveInferenceInFlight = false
+                    val requestId = state.requestId
+                    if (!isCurrentLiveInferenceRequest(requestId)) {
+                        Log.w(TAG, "ignore stale monitor success requestId=${state.requestId}")
+                        return@observe
+                    }
+                    onMonitorPredictionSuccess(state.response, requestId ?: return@observe)
+                    clearLiveInferenceState()
                     if (isMonitoring) {
                         scheduleNextMonitorPoll()
                     }
                 }
                 is MonitorUiState.Error -> {
-                    val isCurrentInference = isCurrentPendingInferenceSession()
+                    val requestId = state.requestId
+                    if (!isCurrentLiveInferenceRequest(requestId)) {
+                        Log.w(TAG, "ignore stale monitor error requestId=${state.requestId}")
+                        return@observe
+                    }
                     clearLiveInferenceState()
                     if (isMonitoring) {
-                        if (isCurrentInference) {
-                            Toast.makeText(this, state.message, Toast.LENGTH_SHORT).show()
-                        }
+                        Toast.makeText(this, state.message, Toast.LENGTH_SHORT).show()
                         scheduleNextMonitorPoll()
                     }
                 }
@@ -460,8 +479,7 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(monitorPollRunnable)
         bleMonitorManager?.stop(silent = true)
         bleMonitorManager = null
-        pendingInferenceSpectrumRange = null
-        pendingInferenceMonitorToken = null
+        clearLiveInferenceState()
         flushActiveMonitorSpectrumAsync(clearSession = true)
         liveMonitorGate.reset()
         hbSeries.clear()
@@ -480,15 +498,21 @@ class MainActivity : AppCompatActivity() {
         return activeMonitorSessionToken
     }
 
+    private fun nextLiveInferenceRequestId(): Long {
+        liveInferenceRequestSequence += 1L
+        return liveInferenceRequestSequence
+    }
+
     private fun clearLiveInferenceState() {
         liveInferenceInFlight = false
+        pendingLiveInferenceRequestId = null
+        pendingInferencePatientId = null
         pendingInferenceSpectrumRange = null
         pendingInferenceMonitorToken = null
     }
 
-    private fun isCurrentPendingInferenceSession(): Boolean {
-        val monitorToken = pendingInferenceMonitorToken ?: return false
-        return isActiveMonitorSession(currentPatientId(), monitorToken)
+    private fun isCurrentLiveInferenceRequest(requestId: Long?): Boolean {
+        return requestId != null && pendingLiveInferenceRequestId == requestId
     }
 
     private fun isActiveMonitorSession(patientId: String, monitorToken: Long): Boolean {
@@ -848,13 +872,15 @@ class MainActivity : AppCompatActivity() {
         startActivity(intent)
     }
 
-    private fun onMonitorPredictionSuccess(response: PredictionResponse) {
+    private fun onMonitorPredictionSuccess(response: PredictionResponse, requestId: Long) {
         val spectrumRange = pendingInferenceSpectrumRange
         val monitorToken = pendingInferenceMonitorToken
-        pendingInferenceSpectrumRange = null
-        pendingInferenceMonitorToken = null
-        val inputId = currentPatientId()
-        if (monitorToken == null || !isActiveMonitorSession(inputId, monitorToken)) {
+        val inputId = pendingInferencePatientId ?: currentPatientId()
+        if (
+            pendingLiveInferenceRequestId != requestId ||
+            monitorToken == null ||
+            !isActiveMonitorSession(inputId, monitorToken)
+        ) {
             Log.w(TAG, "skip stale monitor prediction success for inactive session")
             return
         }

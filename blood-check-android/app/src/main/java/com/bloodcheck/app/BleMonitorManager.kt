@@ -462,11 +462,12 @@ class BleMonitorManager(
             return
         }
 
+        onRawSamplesCallback(parsed, capturedAtMillis)
+
         var count = signalBuffer.size
         parsed.forEach { values ->
             count = signalBuffer.add(values)
         }
-        onRawSamplesCallback(parsed, capturedAtMillis)
         if (count <= 5 || count % 50 == 0) {
             Log.i(TAG, "parsedSamples=$count stableElapsedMs=$stableElapsedMillis last=${parsed.last()}")
         }

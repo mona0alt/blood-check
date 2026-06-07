@@ -14,6 +14,7 @@ import android.provider.Settings
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -36,10 +37,20 @@ import com.chaquo.python.android.AndroidPlatform
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.json.JSONObject
+import java.io.File
+import java.io.RandomAccessFile
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
     companion object {
+        private const val TAG = "BloodCheckMain"
         // 仅用于调试包便捷测试；release 会自动走手动输入1
         private const val FIXED_PATIENT_ID = ""
         private const val REQUEST_BLE_PERMISSIONS = 1001
@@ -120,12 +131,17 @@ class MainActivity : AppCompatActivity() {
         if (id.isEmpty()) return@Runnable
         val snapshot = bleMonitorManager?.snapshot()
         if (snapshot == null || snapshot.size < MIN_LIVE_SIGNAL_ROWS) {
+            pendingInferenceSpectrumRange = null
             if (liveMonitorGate.isOpen) {
                 Toast.makeText(this, "实时数据不足，等待采集...", Toast.LENGTH_SHORT).show()
             }
             scheduleNextMonitorPoll()
             return@Runnable
         }
+        pendingInferenceSpectrumRange = activeMonitorFileSession
+            ?.takeIf { it.patientId == id }
+            ?.batcher
+            ?.currentRange()
         viewModel.predictLiveForMonitoring(id, snapshot.red, snapshot.infrared)
     }
 
@@ -142,6 +158,13 @@ class MainActivity : AppCompatActivity() {
     private var bleLocationDialogShowing: Boolean = false
     private val liveMonitorGate = LiveMonitorGate(MIN_LIVE_SIGNAL_ROWS, LIVE_STABLE_WINDOW_MILLIS)
     private val bleStatusRetryRunnable = Runnable { startBleStatusMonitor() }
+    private val monitorFileExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val patientDataFileStore: PatientDataFileStore by lazy {
+        PatientDataFileStore.fromContext(this)
+    }
+    private val patientRecordCsvWriter = PatientRecordCsvWriter()
+    @Volatile private var activeMonitorFileSession: MonitorFileSession? = null
+    private var pendingInferenceSpectrumRange: BleSpectrumRange? = null
 
     private val hbSeries = mutableListOf<ChartPoint>()
     private val lacSeries = mutableListOf<ChartPoint>()
@@ -184,6 +207,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 is MonitorUiState.Error -> {
+                    pendingInferenceSpectrumRange = null
                     if (isMonitoring) {
                         Toast.makeText(this, state.message, Toast.LENGTH_SHORT).show()
                         scheduleNextMonitorPoll()
@@ -224,6 +248,8 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(bleStatusRetryRunnable)
         bleMonitorManager?.stop(silent = true)
         bleStatusManager?.stop(silent = true)
+        flushActiveMonitorSpectrumAsync(clearSession = false)
+        monitorFileExecutor.shutdown()
     }
 
     private fun bindViews() {
@@ -350,6 +376,7 @@ class MainActivity : AppCompatActivity() {
         updateHasPatientIdUi()
 
         isMonitoring = true
+        rebuildMonitorFileSessionForCurrentPatient(id)
         liveMonitorGate.reset()
         handler.removeCallbacks(monitorPollRunnable)
         updateMonitoringUi()
@@ -368,6 +395,8 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(monitorPollRunnable)
         bleMonitorManager?.stop()
         bleMonitorManager = null
+        pendingInferenceSpectrumRange = null
+        flushActiveMonitorSpectrumAsync(clearSession = true)
         liveMonitorGate.reset()
         updateMonitoringUi()
         Toast.makeText(this, R.string.toast_stopped, Toast.LENGTH_SHORT).show()
@@ -381,10 +410,74 @@ class MainActivity : AppCompatActivity() {
         liveMonitorGate.reset()
         bleMonitorManager?.stop(silent = true)
         bleMonitorManager = null
+        pendingInferenceSpectrumRange = null
+        flushActiveMonitorSpectrumAsync(clearSession = true)
         updateMonitoringUi()
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         handler.removeCallbacks(bleStatusRetryRunnable)
         handler.postDelayed(bleStatusRetryRunnable, BLE_STATUS_RETRY_MILLIS)
+    }
+
+    private fun rebuildMonitorFileSessionForCurrentPatient(patientId: String) {
+        val profile = PatientDataStorage.loadLocalCollectProfile(this)
+        val patientName = profile.name
+        val previousSession = activeMonitorFileSession
+        activeMonitorFileSession = null
+        pendingInferenceSpectrumRange = null
+
+        submitMonitorFileIo("患者数据文件初始化失败") {
+            previousSession?.batcher?.flush()
+
+            val patientDir = patientDataFileStore.patientDirectory(patientName, patientId)
+            val spectrumFile = patientDataFileStore.spectrumFile(patientDir)
+            val initialSampleIndex = MonitorSpectrumFileIndex.nextSampleIndex(spectrumFile)
+            activeMonitorFileSession = MonitorFileSession(
+                patientId = patientId,
+                recordsFile = patientDataFileStore.recordsFile(patientDir),
+                batcher = BleSpectrumBatcher(
+                    spectrumFile = spectrumFile,
+                    sessionId = UUID.randomUUID().toString(),
+                    initialSampleIndex = initialSampleIndex
+                )
+            )
+        }
+    }
+
+    private fun queueRawSpectrumSamples(values: List<BleRawValues>, capturedAtMillis: Long) {
+        if (values.isEmpty()) return
+        val expectedPatientId = monitoringSessionPatientId ?: return
+        submitMonitorFileIo("光谱数据保存失败") {
+            val session = activeMonitorFileSession
+            if (session == null || session.patientId != expectedPatientId) return@submitMonitorFileIo
+            session.batcher.addRawValues(values, capturedAtMillis)
+        }
+    }
+
+    private fun flushActiveMonitorSpectrumAsync(clearSession: Boolean) {
+        val sessionToFlush = activeMonitorFileSession ?: return
+        submitMonitorFileIo("光谱数据写入失败") {
+            sessionToFlush.batcher.flush()
+            if (clearSession && activeMonitorFileSession === sessionToFlush) {
+                activeMonitorFileSession = null
+            }
+        }
+    }
+
+    private fun submitMonitorFileIo(errorMessage: String, block: () -> Unit) {
+        try {
+            monitorFileExecutor.execute {
+                try {
+                    block()
+                } catch (throwable: Throwable) {
+                    Log.w(TAG, errorMessage, throwable)
+                    handler.post {
+                        Toast.makeText(applicationContext, errorMessage, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        } catch (exception: RejectedExecutionException) {
+            Log.w(TAG, "monitor file executor rejected task", exception)
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -445,6 +538,9 @@ class MainActivity : AppCompatActivity() {
                 },
                 onError = { message ->
                     stopMonitoringAfterBleError(message)
+                },
+                onRawSamples = { values, capturedAtMillis ->
+                    queueRawSpectrumSamples(values, capturedAtMillis)
                 }
             )
             if (reused) return
@@ -469,7 +565,10 @@ class MainActivity : AppCompatActivity() {
             onError = { message ->
                 stopMonitoringAfterBleError(message)
             },
-            onConnectionStatus = { status -> updateBleConnectionStatus(status) }
+            onConnectionStatus = { status -> updateBleConnectionStatus(status) },
+            onRawSamples = { values, capturedAtMillis ->
+                queueRawSpectrumSamples(values, capturedAtMillis)
+            }
         )
         bleMonitorManager?.start()
     }
@@ -600,6 +699,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onMonitorPredictionSuccess(response: PredictionResponse) {
+        val spectrumRange = pendingInferenceSpectrumRange
+        pendingInferenceSpectrumRange = null
         val qualityDecision = LivePredictionQualityPolicy.validate(response)
         if (!qualityDecision.accepted) {
             bindEmptyMonitoringMetrics()
@@ -617,7 +718,7 @@ class MainActivity : AppCompatActivity() {
 
         bindPatientHeader(merged)
         bindMonitoringMetrics(merged)
-        persistMonitorRecord(merged, response)
+        persistMonitorRecord(merged, response, spectrumRange)
         appendChartPointsFromModel(merged)
         checkHbAlarm()
         refreshChart()
@@ -771,7 +872,11 @@ class MainActivity : AppCompatActivity() {
         tvDataNa.text = metricText(info?.get("Na+").orEmpty(), "mmol/L")
     }
 
-    private fun persistMonitorRecord(model: PatientMonitorModel, response: PredictionResponse) {
+    private fun persistMonitorRecord(
+        model: PatientMonitorModel,
+        response: PredictionResponse,
+        spectrumRange: BleSpectrumRange?
+    ) {
         val o = JSONObject()
         o.put("patient_id", model.patientId)
         model.patientInfo?.let { o.put("patient_info", it.toJsonObject()) }
@@ -779,7 +884,35 @@ class MainActivity : AppCompatActivity() {
         model.lactate?.let { o.put("lactate", it.toJsonObject()) }
         model.perfusionIndex?.let { o.put("perfusion_index", it.toJsonObject()) }
         o.put("prediction", response.prediction?.toJsonObject())
+        val now = System.currentTimeMillis()
+        o.put("timestamp", now)
+        o.put("dateTime", monitorRecordDateTime(now))
         PatientDataStorage.appendRecord(this, model.patientId, o)
+
+        if (spectrumRange == null) {
+            Log.w(TAG, "skip records.csv append because no spectrum range was captured")
+            return
+        }
+
+        val filePatientId = currentPatientId()
+        submitMonitorFileIo("监测记录文件保存失败") {
+            val session = activeMonitorFileSession
+            if (session == null || session.patientId != filePatientId) {
+                Log.w(TAG, "skip records.csv append because active file session changed")
+                return@submitMonitorFileIo
+            }
+            session.batcher.flush()
+            patientRecordCsvWriter.appendRecord(
+                file = session.recordsFile,
+                record = o,
+                spectrumStartIndex = spectrumRange.startIndex,
+                spectrumEndIndex = spectrumRange.endIndex
+            )
+        }
+    }
+
+    private fun monitorRecordDateTime(epochMillis: Long): String {
+        return SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.CHINA).format(Date(epochMillis))
     }
 
     private fun appendChartPointsFromModel(model: PatientMonitorModel) {
@@ -1237,6 +1370,73 @@ class MainActivity : AppCompatActivity() {
             this,
             saved.copy(hospitalId = id)
         )
+    }
+}
+
+private data class MonitorFileSession(
+    val patientId: String,
+    val recordsFile: File,
+    val batcher: BleSpectrumBatcher
+)
+
+internal object MonitorSpectrumFileIndex {
+    fun nextSampleIndex(spectrumFile: File): Long {
+        if (!spectrumFile.isFile || spectrumFile.length() == 0L) return 0L
+        val tailLine = lastNonEmptyLine(spectrumFile) ?: return 0L
+        return firstCsvCell(tailLine)
+            ?.toLongOrNull()
+            ?.let { it + 1L }
+            ?: 0L
+    }
+
+    private fun lastNonEmptyLine(file: File): String? {
+        RandomAccessFile(file, "r").use { randomAccessFile ->
+            var pointer = randomAccessFile.length() - 1L
+            val reversedBytes = ArrayList<Byte>()
+            var foundContent = false
+
+            while (pointer >= 0L) {
+                randomAccessFile.seek(pointer)
+                val byte = randomAccessFile.readByte()
+                if (byte == '\n'.code.toByte() || byte == '\r'.code.toByte()) {
+                    if (foundContent) break
+                } else {
+                    foundContent = true
+                    reversedBytes.add(byte)
+                }
+                pointer -= 1L
+            }
+
+            if (!foundContent) return null
+            reversedBytes.reverse()
+            return reversedBytes.toByteArray().toString(Charsets.UTF_8)
+        }
+    }
+
+    private fun firstCsvCell(line: String): String? {
+        val trimmed = line.trim().removePrefix("\uFEFF")
+        if (trimmed.isEmpty()) return null
+        if (!trimmed.startsWith("\"")) {
+            return trimmed.substringBefore(",").trim()
+        }
+
+        val value = StringBuilder()
+        var index = 1
+        while (index < trimmed.length) {
+            val char = trimmed[index]
+            if (char == '"') {
+                val next = trimmed.getOrNull(index + 1)
+                if (next == '"') {
+                    value.append('"')
+                    index += 2
+                    continue
+                }
+                return value.toString()
+            }
+            value.append(char)
+            index += 1
+        }
+        return null
     }
 }
 

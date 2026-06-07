@@ -131,7 +131,7 @@ class BleMonitorManager(
     warmupMillis: Long = 0L,
     private val scanTimeoutMillis: Long = 12_000L,
     private val onConnectionStatus: (BleConnectionStatus) -> Unit = {},
-    private val onRawSamples: (List<BleRawValues>, Long) -> Unit = { _, _ -> }
+    onRawSamples: (List<BleRawValues>, Long) -> Unit = { _, _ -> }
 ) {
     companion object {
         private const val TAG = "BloodCheckBle"
@@ -159,6 +159,7 @@ class BleMonitorManager(
     @Volatile private var onStatusCallback: (String) -> Unit = onStatus
     @Volatile private var onSampleCountChangedCallback: (Int, Long) -> Unit = onSampleCountChanged
     @Volatile private var onErrorCallback: (String) -> Unit = onError
+    @Volatile private var onRawSamplesCallback: (List<BleRawValues>, Long) -> Unit = onRawSamples
 
     val isReadyToCollect: Boolean
         get() = gatt != null && txCharacteristic != null
@@ -296,12 +297,14 @@ class BleMonitorManager(
         warmupMillis: Long,
         onStatus: (String) -> Unit,
         onSampleCountChanged: (Int, Long) -> Unit,
-        onError: (String) -> Unit
+        onError: (String) -> Unit,
+        onRawSamples: (List<BleRawValues>, Long) -> Unit = { _, _ -> }
     ): Boolean {
         require(warmupMillis >= 0L) { "warmupMillis must not be negative" }
         onStatusCallback = onStatus
         onSampleCountChangedCallback = onSampleCountChanged
         onErrorCallback = onError
+        onRawSamplesCallback = onRawSamples
         monitorMode = BleMonitorMode.COLLECTING
         collectionWarmupMillis = warmupMillis
         resetCollectionBuffers()
@@ -462,7 +465,7 @@ class BleMonitorManager(
         parsed.forEach { values ->
             count = signalBuffer.add(values)
         }
-        onRawSamples(parsed, now)
+        onRawSamplesCallback(parsed, now)
         if (count <= 5 || count % 50 == 0) {
             Log.i(TAG, "parsedSamples=$count stableElapsedMs=$stableElapsedMillis last=${parsed.last()}")
         }

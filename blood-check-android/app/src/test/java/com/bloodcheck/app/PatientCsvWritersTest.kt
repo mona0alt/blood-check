@@ -59,6 +59,22 @@ class PatientCsvWritersTest {
     }
 
     @Test
+    fun monitorSpectrumNextSampleIndexContinuesAfterExistingCsvTail() {
+        val dir = tempDir("patient-csv-tail")
+        val file = File(dir, PatientDataFileStore.SPECTRUM_FILE)
+        SpectrumCsvWriter().appendSamples(
+            file,
+            listOf(
+                BleRawSample(40, "s1", 1000L, 1, 2, 3, 4.0, 5.0),
+                BleRawSample(41, "s1", 1010L, 6, 7, 8, 9.0, 10.0)
+            )
+        )
+        file.appendText("\n", StandardCharsets.UTF_8)
+
+        assertEquals(42L, MonitorSpectrumFileIndex.nextSampleIndex(file))
+    }
+
+    @Test
     fun zipExportIncludesRecordsAndSpectrumWhenPresent() {
         val dir = tempDir("patient-zip")
         File(dir, PatientDataFileStore.RECORDS_FILE).writeText("records")

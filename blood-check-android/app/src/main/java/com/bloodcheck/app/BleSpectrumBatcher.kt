@@ -8,18 +8,53 @@ data class BleSpectrumRange(
     val endIndex: Long
 )
 
-class BleSpectrumBatcher(
+class BleSpectrumBatcher private constructor(
     private val spectrumFile: File,
     private val sessionId: String,
     initialSampleIndex: Long,
     private val batchSize: Int = 100,
-    private val writer: SpectrumCsvWriter = SpectrumCsvWriter()
+    private val appendSamples: (File, List<BleRawSample>) -> Unit,
+    @Suppress("UNUSED_PARAMETER") constructorMarker: Unit
 ) {
     private val lock = Any()
+    private val writeLock = Object()
     private val startIndex = initialSampleIndex
     private val pending = mutableListOf<BleRawSample>()
     private var nextSampleIndex = initialSampleIndex
+    private var nextBatchSequence = 0L
     private var flushedIndex = initialSampleIndex - 1
+    private var nextWriteSequence = 0L
+    private var writeFailure: Throwable? = null
+
+    constructor(
+        spectrumFile: File,
+        sessionId: String,
+        initialSampleIndex: Long,
+        batchSize: Int = 100,
+        writer: SpectrumCsvWriter = SpectrumCsvWriter()
+    ) : this(
+        spectrumFile = spectrumFile,
+        sessionId = sessionId,
+        initialSampleIndex = initialSampleIndex,
+        batchSize = batchSize,
+        appendSamples = writer::appendSamples,
+        constructorMarker = Unit
+    )
+
+    internal constructor(
+        spectrumFile: File,
+        sessionId: String,
+        initialSampleIndex: Long,
+        batchSize: Int = 100,
+        appendSamples: (File, List<BleRawSample>) -> Unit
+    ) : this(
+        spectrumFile = spectrumFile,
+        sessionId = sessionId,
+        initialSampleIndex = initialSampleIndex,
+        batchSize = batchSize,
+        appendSamples = appendSamples,
+        constructorMarker = Unit
+    )
 
     val currentStartIndex: Long
         get() = synchronized(lock) { startIndex }
@@ -51,7 +86,7 @@ class BleSpectrumBatcher(
     fun addRawValues(values: List<BleRawValues>, capturedAtMillis: Long) {
         if (values.isEmpty()) return
 
-        val samplesToWrite = synchronized(lock) {
+        val batchToWrite = synchronized(lock) {
             values.forEach { rawValues ->
                 pending.add(
                     BleRawSample(
@@ -68,33 +103,65 @@ class BleSpectrumBatcher(
                 nextSampleIndex += 1
             }
 
-            if (pending.size >= batchSize) drainPendingLocked() else emptyList()
+            if (pending.size >= batchSize) drainPendingLocked() else null
         }
 
-        writeSamples(samplesToWrite)
+        writeBatch(batchToWrite)
     }
 
     @WorkerThread
     fun flush() {
-        val samplesToWrite = synchronized(lock) {
-            if (pending.isEmpty()) emptyList() else drainPendingLocked()
+        val batchToWrite = synchronized(lock) {
+            if (pending.isEmpty()) null else drainPendingLocked()
         }
 
-        writeSamples(samplesToWrite)
+        writeBatch(batchToWrite)
     }
 
-    private fun drainPendingLocked(): List<BleRawSample> {
+    private fun drainPendingLocked(): PendingBatch {
         val samples = pending.toList()
         pending.clear()
-        return samples
+        return PendingBatch(sequence = nextBatchSequence++, samples = samples)
     }
 
-    private fun writeSamples(samples: List<BleRawSample>) {
-        if (samples.isEmpty()) return
+    private fun writeBatch(batch: PendingBatch?) {
+        if (batch == null) return
 
-        writer.appendSamples(spectrumFile, samples)
-        synchronized(lock) {
-            flushedIndex = maxOf(flushedIndex, samples.last().sampleIndex)
+        synchronized(writeLock) {
+            throwIfWriteFailedLocked()
+            while (batch.sequence != nextWriteSequence) {
+                try {
+                    writeLock.wait()
+                } catch (exception: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw IllegalStateException("Interrupted while waiting to write spectrum batch", exception)
+                }
+                throwIfWriteFailedLocked()
+            }
+
+            try {
+                appendSamples(spectrumFile, batch.samples)
+                synchronized(lock) {
+                    flushedIndex = batch.samples.last().sampleIndex
+                }
+            } catch (throwable: Throwable) {
+                writeFailure = throwable
+                throw throwable
+            } finally {
+                nextWriteSequence += 1
+                writeLock.notifyAll()
+            }
         }
     }
+
+    private fun throwIfWriteFailedLocked() {
+        writeFailure?.let { failure ->
+            throw IllegalStateException("Spectrum batch writer failed", failure)
+        }
+    }
+
+    private data class PendingBatch(
+        val sequence: Long,
+        val samples: List<BleRawSample>
+    )
 }

@@ -1,10 +1,15 @@
 package com.bloodcheck.app
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class BleSpectrumBatcherTest {
     @Test
@@ -130,8 +135,68 @@ class BleSpectrumBatcherTest {
         }
     }
 
+    @Test
+    fun concurrentDrainsWriteInDrainOrderAndUpdateLastFlushedAfterWriteCompletes() {
+        val file = File(tempDir("ble-spectrum-batcher"), "spectrum.csv")
+        val firstWriteStarted = CountDownLatch(1)
+        val allowFirstWrite = CountDownLatch(1)
+        val secondWriteAttempted = CountDownLatch(1)
+        val writes = Collections.synchronizedList(mutableListOf<Long>())
+        val threadError = AtomicReference<Throwable?>()
+        val batcher = BleSpectrumBatcher(
+            spectrumFile = file,
+            sessionId = "session-concurrent",
+            initialSampleIndex = 0,
+            batchSize = 1,
+            appendSamples = { _, samples ->
+                if (samples.first().sampleIndex == 0L) {
+                    firstWriteStarted.countDown()
+                    allowFirstWrite.await(5, TimeUnit.SECONDS)
+                } else {
+                    secondWriteAttempted.countDown()
+                }
+                writes.add(samples.first().sampleIndex)
+            }
+        )
+
+        val firstThread = Thread {
+            captureThreadError(threadError) {
+                batcher.addRawValues(BleRawValues(c1 = 1, c2 = 2, c3 = 3, red = 4.0, infrared = 5.0), 1000L)
+            }
+        }
+        val secondThread = Thread {
+            captureThreadError(threadError) {
+                batcher.addRawValues(BleRawValues(c1 = 6, c2 = 7, c3 = 8, red = 9.0, infrared = 10.0), 1010L)
+            }
+        }
+
+        firstThread.start()
+        org.junit.Assert.assertTrue(firstWriteStarted.await(5, TimeUnit.SECONDS))
+
+        secondThread.start()
+
+        assertFalse(secondWriteAttempted.await(200, TimeUnit.MILLISECONDS))
+        assertEquals(-1L, batcher.lastFlushedIndex)
+
+        allowFirstWrite.countDown()
+        firstThread.join(5_000)
+        secondThread.join(5_000)
+
+        threadError.get()?.let { throw AssertionError("Worker thread failed", it) }
+        assertEquals(listOf(0L, 1L), writes.toList())
+        assertEquals(1L, batcher.lastFlushedIndex)
+    }
+
     private fun assertTrueContains(actual: String, expectedSubstring: String) {
         org.junit.Assert.assertTrue("$actual should contain $expectedSubstring", actual.contains(expectedSubstring))
+    }
+
+    private fun captureThreadError(error: AtomicReference<Throwable?>, block: () -> Unit) {
+        try {
+            block()
+        } catch (throwable: Throwable) {
+            error.compareAndSet(null, throwable)
+        }
     }
 
     private fun tempDir(prefix: String): File = Files.createTempDirectory(prefix).toFile()

@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
@@ -15,8 +16,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import java.util.ArrayDeque
 import java.util.UUID
-import java.util.concurrent.CopyOnWriteArrayList
 
 enum class BleMonitorMode {
     STATUS_ONLY,
@@ -75,6 +76,52 @@ object BleRawSampleParser {
     }
 }
 
+class BleSignalBuffer(private val maxPoints: Int) {
+    private val lock = Any()
+    private val redSignals = ArrayDeque<Double>()
+    private val infraredSignals = ArrayDeque<Double>()
+
+    val size: Int
+        get() = synchronized(lock) {
+            minOf(redSignals.size, infraredSignals.size)
+        }
+
+    init {
+        require(maxPoints > 0) { "maxPoints must be positive" }
+    }
+
+    fun add(values: BleRawValues): Int = synchronized(lock) {
+        redSignals.addLast(values.red)
+        infraredSignals.addLast(values.infrared)
+        trimLocked()
+        minOf(redSignals.size, infraredSignals.size)
+    }
+
+    fun snapshot(): BleSignalSnapshot = synchronized(lock) {
+        val minSize = minOf(redSignals.size, infraredSignals.size)
+        if (minSize <= 0) {
+            BleSignalSnapshot(emptyList(), emptyList())
+        } else {
+            BleSignalSnapshot(
+                redSignals.toList().takeLast(minSize),
+                infraredSignals.toList().takeLast(minSize)
+            )
+        }
+    }
+
+    fun clear() {
+        synchronized(lock) {
+            redSignals.clear()
+            infraredSignals.clear()
+        }
+    }
+
+    private fun trimLocked() {
+        while (redSignals.size > maxPoints) redSignals.removeFirst()
+        while (infraredSignals.size > maxPoints) infraredSignals.removeFirst()
+    }
+}
+
 class BleMonitorManager(
     private val context: Context,
     onStatus: (String) -> Unit,
@@ -96,9 +143,9 @@ class BleMonitorManager(
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val redSignals = CopyOnWriteArrayList<Double>()
-    private val infraredSignals = CopyOnWriteArrayList<Double>()
+    private val signalBuffer = BleSignalBuffer(MAX_SIGNAL_POINTS)
     private val pendingText = StringBuilder()
+    private val collectionStateLock = Any()
 
     private var adapter: BluetoothAdapter? = null
     private var gatt: BluetoothGatt? = null
@@ -300,31 +347,41 @@ class BleMonitorManager(
     }
 
     fun snapshot(): BleSignalSnapshot {
-        val minSize = minOf(redSignals.size, infraredSignals.size)
-        if (minSize <= 0) return BleSignalSnapshot(emptyList(), emptyList())
-        return BleSignalSnapshot(
-            redSignals.takeLast(minSize),
-            infraredSignals.takeLast(minSize)
-        )
+        return signalBuffer.snapshot()
     }
 
     private fun enableDataNotifications(gatt: BluetoothGatt, tx: BluetoothGattCharacteristic): Boolean {
         try {
-            gatt.setCharacteristicNotification(tx, true)
+            val notificationEnabled = gatt.setCharacteristicNotification(tx, true)
+            if (!notificationEnabled) {
+                postConnectionStatus(BleConnectionState.ERROR, "蓝牙通知启用失败")
+                postError("蓝牙通知启用失败")
+                return false
+            }
+
             val descriptor = tx.getDescriptor(CLIENT_CONFIG_UUID)
             Log.i(TAG, "tx characteristic found descriptor=${descriptor != null}")
-            if (descriptor != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(
-                        descriptor,
-                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    )
-                } else {
-                    @Suppress("DEPRECATION")
-                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    @Suppress("DEPRECATION")
-                    gatt.writeDescriptor(descriptor)
-                }
+            if (descriptor == null) {
+                postConnectionStatus(BleConnectionState.ERROR, "未找到蓝牙通知描述符")
+                postError("未找到蓝牙通知描述符")
+                return false
+            }
+
+            val descriptorWriteSucceeded = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(
+                    descriptor,
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                ) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                @Suppress("DEPRECATION")
+                gatt.writeDescriptor(descriptor)
+            }
+            if (!descriptorWriteSucceeded) {
+                postConnectionStatus(BleConnectionState.ERROR, "蓝牙通知描述符写入失败")
+                postError("蓝牙通知描述符写入失败")
+                return false
             }
         } catch (e: SecurityException) {
             postConnectionStatus(BleConnectionState.ERROR, "缺少蓝牙通知权限")
@@ -339,13 +396,14 @@ class BleMonitorManager(
     private fun handleNotification(value: ByteArray) {
         if (monitorMode != BleMonitorMode.COLLECTING) return
         val chunk = value.toString(Charsets.UTF_8)
-        synchronized(pendingText) {
+        var droppedBufferPreview: String? = null
+        val parsed = synchronized(pendingText) {
             pendingText.append(chunk)
-            val parsed = mutableListOf<BleRawValues>()
+            val rows = mutableListOf<BleRawValues>()
             while (true) {
                 val text = pendingText.toString()
                 val match = Regex("""array:\s*\[([^\]]+)]""").find(text) ?: break
-                BleRawSampleParser.parse(match.value)?.let { parsed.add(it) }
+                BleRawSampleParser.parse(match.value)?.let { rows.add(it) }
                 pendingText.delete(0, match.range.last + 1)
                 val sumIndex = pendingText.indexOf("}")
                 if (sumIndex >= 0) {
@@ -353,44 +411,48 @@ class BleMonitorManager(
                 }
             }
             if (pendingText.length > 512) {
-                Log.w(TAG, "dropping unparsable buffer=${pendingText.take(120)}")
+                droppedBufferPreview = pendingText.take(120).toString()
                 pendingText.clear()
             }
-            if (parsed.isEmpty()) {
-                Log.d(TAG, "notification chunk not parsed len=${value.size} text=${chunk.take(80)}")
-                return
-            }
+            rows
+        }
+        droppedBufferPreview?.let { preview ->
+            Log.w(TAG, "dropping unparsable buffer=$preview")
+        }
+        if (parsed.isEmpty()) {
+            Log.d(TAG, "notification chunk not parsed len=${value.size} text=${chunk.take(80)}")
+            return
+        }
 
-            val now = SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
+        var shouldLogWarmupDrop = false
+        val stableElapsedMillis = synchronized(collectionStateLock) {
             if (firstDataElapsedMs == 0L) {
                 firstDataElapsedMs = now
             }
-            val stableElapsedMillis = now - firstDataElapsedMs - collectionWarmupMillis
-            if (stableElapsedMillis < 0L) {
-                if (!warmupLogged) {
-                    Log.i(TAG, "warmup active, dropping initial samples for ${collectionWarmupMillis}ms")
-                    warmupLogged = true
-                }
-                return
+            val elapsedMillis = now - firstDataElapsedMs - collectionWarmupMillis
+            if (elapsedMillis < 0L && !warmupLogged) {
+                warmupLogged = true
+                shouldLogWarmupDrop = true
             }
-
-            parsed.forEach { values ->
-                redSignals.add(values.red)
-                infraredSignals.add(values.infrared)
-                trimSignals()
-            }
-            onRawSamples(parsed, now)
-            val count = minOf(redSignals.size, infraredSignals.size)
-            if (count <= 5 || count % 50 == 0) {
-                Log.i(TAG, "parsedSamples=$count stableElapsedMs=$stableElapsedMillis last=${parsed.last()}")
-            }
-            mainHandler.post { onSampleCountChangedCallback(count, stableElapsedMillis) }
+            elapsedMillis
         }
-    }
+        if (stableElapsedMillis < 0L) {
+            if (shouldLogWarmupDrop) {
+                Log.i(TAG, "warmup active, dropping initial samples for ${collectionWarmupMillis}ms")
+            }
+            return
+        }
 
-    private fun trimSignals() {
-        while (redSignals.size > MAX_SIGNAL_POINTS) redSignals.removeAt(0)
-        while (infraredSignals.size > MAX_SIGNAL_POINTS) infraredSignals.removeAt(0)
+        var count = signalBuffer.size
+        parsed.forEach { values ->
+            count = signalBuffer.add(values)
+        }
+        onRawSamples(parsed, now)
+        if (count <= 5 || count % 50 == 0) {
+            Log.i(TAG, "parsedSamples=$count stableElapsedMs=$stableElapsedMillis last=${parsed.last()}")
+        }
+        mainHandler.post { onSampleCountChangedCallback(count, stableElapsedMillis) }
     }
 
     private fun clearSignals() {
@@ -399,13 +461,14 @@ class BleMonitorManager(
     }
 
     private fun resetCollectionBuffers() {
-        redSignals.clear()
-        infraredSignals.clear()
+        signalBuffer.clear()
         synchronized(pendingText) {
             pendingText.clear()
         }
-        firstDataElapsedMs = 0L
-        warmupLogged = false
+        synchronized(collectionStateLock) {
+            firstDataElapsedMs = 0L
+            warmupLogged = false
+        }
     }
 
     private fun stopScan() {

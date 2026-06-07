@@ -21,4 +21,20 @@ class BleRawSampleParserTest {
     fun rejectsArraysThatDoNotHaveFiveValues() {
         assertNull(BleRawSampleParser.parse("{array:[1,2,3,4],sum:10}"))
     }
+
+    @Test
+    fun sampleBufferKeepsLatestBoundedPairs() {
+        val buffer = BleSignalBuffer(maxPoints = 3)
+
+        buffer.add(BleRawValues(c1 = 0, c2 = 0, c3 = 0, red = 1.0, infrared = 10.0))
+        buffer.add(BleRawValues(c1 = 0, c2 = 0, c3 = 0, red = 2.0, infrared = 20.0))
+        buffer.add(BleRawValues(c1 = 0, c2 = 0, c3 = 0, red = 3.0, infrared = 30.0))
+        buffer.add(BleRawValues(c1 = 0, c2 = 0, c3 = 0, red = 4.0, infrared = 40.0))
+
+        val snapshot = buffer.snapshot()
+
+        assertEquals(listOf(2.0, 3.0, 4.0), snapshot.red)
+        assertEquals(listOf(20.0, 30.0, 40.0), snapshot.infrared)
+        assertEquals(3, buffer.size)
+    }
 }

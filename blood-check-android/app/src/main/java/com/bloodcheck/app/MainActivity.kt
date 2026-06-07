@@ -127,6 +127,7 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private val monitorPollRunnable = Runnable {
         if (!isMonitoring) return@Runnable
+        if (liveInferenceInFlight) return@Runnable
         val id = currentPatientId()
         if (id.isEmpty()) return@Runnable
         val snapshot = bleMonitorManager?.snapshot()
@@ -141,6 +142,7 @@ class MainActivity : AppCompatActivity() {
         val redSnapshot = snapshot.red
         val infraredSnapshot = snapshot.infrared
         val monitorToken = activeMonitorSessionToken
+        liveInferenceInFlight = true
         submitMonitorFileIo(
             errorMessage = "监测文件状态读取失败",
             disableWritesOnFailure = false,
@@ -151,7 +153,10 @@ class MainActivity : AppCompatActivity() {
                 ?.batcher
                 ?.currentRange()
             handler.post {
-                if (!isActiveMonitorSession(id, monitorToken)) return@post
+                if (!isActiveMonitorSession(id, monitorToken)) {
+                    clearLiveInferenceState()
+                    return@post
+                }
                 pendingInferenceSpectrumRange = spectrumRange
                 pendingInferenceMonitorToken = monitorToken
                 viewModel.predictLiveForMonitoring(id, redSnapshot, infraredSnapshot)
@@ -181,6 +186,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var activeMonitorSessionToken: Long = 0L
     @Volatile private var monitorFileWritesDisabled: Boolean = false
     @Volatile private var lastMonitorFileIoToastAtMillis: Long = 0L
+    private var liveInferenceInFlight: Boolean = false
     private var pendingInferenceSpectrumRange: BleSpectrumRange? = null
     private var pendingInferenceMonitorToken: Long? = null
 
@@ -220,15 +226,18 @@ class MainActivity : AppCompatActivity() {
             when (state) {
                 is MonitorUiState.Success -> {
                     onMonitorPredictionSuccess(state.response)
+                    liveInferenceInFlight = false
                     if (isMonitoring) {
                         scheduleNextMonitorPoll()
                     }
                 }
                 is MonitorUiState.Error -> {
-                    pendingInferenceSpectrumRange = null
-                    pendingInferenceMonitorToken = null
+                    val isCurrentInference = isCurrentPendingInferenceSession()
+                    clearLiveInferenceState()
                     if (isMonitoring) {
-                        Toast.makeText(this, state.message, Toast.LENGTH_SHORT).show()
+                        if (isCurrentInference) {
+                            Toast.makeText(this, state.message, Toast.LENGTH_SHORT).show()
+                        }
                         scheduleNextMonitorPoll()
                     }
                 }
@@ -264,8 +273,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         nextMonitorSessionToken()
-        pendingInferenceSpectrumRange = null
-        pendingInferenceMonitorToken = null
+        clearLiveInferenceState()
         handler.removeCallbacks(monitorPollRunnable)
         handler.removeCallbacks(bleStatusRetryRunnable)
         bleMonitorManager?.stop(silent = true)
@@ -422,8 +430,7 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(monitorPollRunnable)
         bleMonitorManager?.stop()
         bleMonitorManager = null
-        pendingInferenceSpectrumRange = null
-        pendingInferenceMonitorToken = null
+        clearLiveInferenceState()
         flushActiveMonitorSpectrumAsync(clearSession = true)
         liveMonitorGate.reset()
         updateMonitoringUi()
@@ -439,8 +446,7 @@ class MainActivity : AppCompatActivity() {
         liveMonitorGate.reset()
         bleMonitorManager?.stop(silent = true)
         bleMonitorManager = null
-        pendingInferenceSpectrumRange = null
-        pendingInferenceMonitorToken = null
+        clearLiveInferenceState()
         flushActiveMonitorSpectrumAsync(clearSession = true)
         updateMonitoringUi()
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
@@ -448,9 +454,41 @@ class MainActivity : AppCompatActivity() {
         handler.postDelayed(bleStatusRetryRunnable, BLE_STATUS_RETRY_MILLIS)
     }
 
+    private fun restartMonitoringForPatientChange() {
+        if (!isMonitoring) return
+        nextMonitorSessionToken()
+        handler.removeCallbacks(monitorPollRunnable)
+        bleMonitorManager?.stop(silent = true)
+        bleMonitorManager = null
+        pendingInferenceSpectrumRange = null
+        pendingInferenceMonitorToken = null
+        flushActiveMonitorSpectrumAsync(clearSession = true)
+        liveMonitorGate.reset()
+        hbSeries.clear()
+        lacSeries.clear()
+        lastHbChartTime = 0L
+        lastLacChartTime = 0L
+        hbAlarm = false
+        refreshChart()
+        updateLegendColors()
+        monitoringSessionPatientId = null
+        runWhenBleReady { startMonitoringInternal(fromAuto = true) }
+    }
+
     private fun nextMonitorSessionToken(): Long {
         activeMonitorSessionToken += 1L
         return activeMonitorSessionToken
+    }
+
+    private fun clearLiveInferenceState() {
+        liveInferenceInFlight = false
+        pendingInferenceSpectrumRange = null
+        pendingInferenceMonitorToken = null
+    }
+
+    private fun isCurrentPendingInferenceSession(): Boolean {
+        val monitorToken = pendingInferenceMonitorToken ?: return false
+        return isActiveMonitorSession(currentPatientId(), monitorToken)
     }
 
     private fun isActiveMonitorSession(patientId: String, monitorToken: Long): Boolean {
@@ -1308,11 +1346,15 @@ class MainActivity : AppCompatActivity() {
         dlg.setCanceledOnTouchOutside(true)
 
         btnSubmit.setOnClickListener {
+            val oldPatientId = currentPatientId()
             val hospitalId = etHospital.text?.toString()?.trim().orEmpty()
             if (hospitalId.isEmpty()) {
                 Toast.makeText(this, R.string.toast_collect_patient_data_first, Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
+            val patientChangedDuringMonitoring = isMonitoring &&
+                oldPatientId.isNotBlank() &&
+                oldPatientId != hospitalId
             val profile = LocalCollectProfile(
                 name = etName.text?.toString()?.trim().orEmpty(),
                 gender = selectedGender,
@@ -1324,7 +1366,16 @@ class MainActivity : AppCompatActivity() {
             PatientDataStorage.saveLocalCollectProfile(this, profile)
 
             val patch = profile.toPatientInfoPatch()
-            if (patch.values.isNotEmpty()) {
+            if (patientChangedDuringMonitoring) {
+                monitorModel = PatientMonitorModel(
+                    patientId = hospitalId,
+                    patientInfo = patch.takeIf { it.values.isNotEmpty() },
+                    hemoglobin = null,
+                    lactate = null,
+                    perfusionIndex = null
+                )
+                bindEmptyMonitoringMetrics()
+            } else if (patch.values.isNotEmpty()) {
                 val m = monitorModel
                 monitorModel = if (m != null) {
                     m.copy(
@@ -1367,6 +1418,9 @@ class MainActivity : AppCompatActivity() {
             updateMonitoringUi()
             if (!currentTabHome) {
                 refreshMinePage()
+            }
+            if (patientChangedDuringMonitoring) {
+                restartMonitoringForPatientChange()
             }
             dlg.dismiss()
         }

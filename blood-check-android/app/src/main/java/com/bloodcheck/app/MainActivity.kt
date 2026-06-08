@@ -1685,6 +1685,8 @@ private data class MonitorFileSession(
 )
 
 internal object PatientDatasetDirectoryResolver {
+    private const val TAG = "PatientDatasetResolver"
+
     fun resolve(
         store: PatientDataFileStore,
         patientId: String,
@@ -1705,7 +1707,7 @@ internal object PatientDatasetDirectoryResolver {
             .filter { summary ->
                 summary.hasActualDataFiles() &&
                     summary.folderName != fallback.name &&
-                    matchesHistoricalPatientId(summary.folderName, safePatientIdSuffix)
+                    matchesHistoricalPatientId(summary, safePatientIdSuffix, patientId)
             }
 
         val existing = matching
@@ -1722,10 +1724,62 @@ internal object PatientDatasetDirectoryResolver {
         return hasRecords || hasSpectrum
     }
 
-    private fun matchesHistoricalPatientId(folderName: String, safePatientIdSuffix: String): Boolean {
+    private fun matchesHistoricalPatientId(
+        summary: PatientDataSetSummary,
+        safePatientIdSuffix: String,
+        patientId: String
+    ): Boolean {
+        val folderName = summary.folderName
         if (!folderName.endsWith(safePatientIdSuffix)) return false
         val namePrefix = folderName.removeSuffix(safePatientIdSuffix)
-        return namePrefix.isNotBlank() && !namePrefix.contains("_")
+        if (namePrefix.isBlank()) return false
+        if (!namePrefix.contains("_")) return true
+        return recordsCsvContainsPatientId(File(summary.dir, PatientDataFileStore.RECORDS_FILE), patientId)
+    }
+
+    private fun recordsCsvContainsPatientId(recordsFile: File, patientId: String): Boolean {
+        if (!recordsFile.isFile) return false
+        return try {
+            val lines = recordsFile.bufferedReader().use { reader ->
+                generateSequence { reader.readLine() }
+                    .take(6)
+                    .toList()
+            }
+            val header = lines.firstOrNull()?.removePrefix("\uFEFF") ?: return false
+            val patientIdIndex = parseCsvLine(header).indexOf("患者ID")
+            if (patientIdIndex < 0) return false
+            lines.drop(1).any { line ->
+                parseCsvLine(line).getOrNull(patientIdIndex) == patientId
+            }
+        } catch (throwable: Throwable) {
+            Log.w(TAG, "failed to validate historical records.csv patient id", throwable)
+            false
+        }
+    }
+
+    private fun parseCsvLine(line: String): List<String> {
+        val values = mutableListOf<String>()
+        val current = StringBuilder()
+        var inQuotes = false
+        var index = 0
+        while (index < line.length) {
+            val char = line[index]
+            when {
+                char == '"' && inQuotes && line.getOrNull(index + 1) == '"' -> {
+                    current.append('"')
+                    index += 1
+                }
+                char == '"' -> inQuotes = !inQuotes
+                char == ',' && !inQuotes -> {
+                    values.add(current.toString())
+                    current.clear()
+                }
+                else -> current.append(char)
+            }
+            index += 1
+        }
+        values.add(current.toString())
+        return values
     }
 }
 

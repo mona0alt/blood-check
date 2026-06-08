@@ -61,7 +61,7 @@ class PatientDataFilesTest {
         val store = PatientDataFileStore(root)
         val wrongDir = store.patientDirectory("患者", "abc_001")
         wrongDir.mkdirs()
-        File(wrongDir, PatientDataFileStore.RECORDS_FILE).writeText("wrong")
+        writeRecordCsv(wrongDir, patientId = "abc_001")
         val fallback = store.patientDirectory("新姓名", "001")
 
         val resolved = PatientDatasetDirectoryResolver.resolve(
@@ -72,6 +72,24 @@ class PatientDataFilesTest {
         )
 
         assertEquals(fallback.absolutePath, resolved.absolutePath)
+    }
+
+    @Test
+    fun exportResolverValidatesUnderscoreHistoricalNameUsingRecordsPatientId() {
+        val root = createTempDir(prefix = "patient-files")
+        val store = PatientDataFileStore(root)
+        val oldNameDir = store.patientDirectory("张 三", "p001")
+        oldNameDir.mkdirs()
+        writeRecordCsv(oldNameDir, patientId = "p001")
+
+        val resolved = PatientDatasetDirectoryResolver.resolve(
+            store = store,
+            patientId = "p001",
+            currentPatientName = "新姓名",
+            activeSessionDirectory = null
+        )
+
+        assertEquals(oldNameDir.absolutePath, resolved.absolutePath)
     }
 
     @Test
@@ -152,5 +170,11 @@ class PatientDataFilesTest {
         assertEquals(0, result.deleted)
         assertTrue(outside.exists())
         assertTrue(File(outside, PatientDataFileStore.RECORDS_FILE).exists())
+    }
+
+    private fun writeRecordCsv(patientDir: File, patientId: String) {
+        File(patientDir, PatientDataFileStore.RECORDS_FILE).writeText(
+            "\"时间\",\"患者ID\"\n\"2026/06/08 10:00:00\",\"$patientId\"\n"
+        )
     }
 }

@@ -1497,20 +1497,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun deleteSelectedFileFoldersAsync(folderNames: List<String>) {
-        val protectedFolderName = currentProtectedFileFolderName()
         val refreshToken = ++fileManagementRefreshToken
         submitMonitorFileIo(
             errorMessage = "患者数据文件删除失败",
             disableWritesOnFailure = false,
             skipWhenFileWritesDisabled = false
         ) {
+            val protectedFolderName = activeMonitorFileSession?.recordsFile?.parentFile?.name
             val result = patientDataFileStore.deleteDataSets(folderNames, protectedFolderName)
             val summaries = patientDataFileStore.listDataSets()
             handler.post {
-                if (!canShowExportResultUi() || fileManagementRefreshToken != refreshToken) return@post
-                fileSummaries = summaries
-                selectedFileFolders.retainAll(fileSummaries.map { it.folderName }.toSet())
-                renderFileManagementList()
+                if (!canShowExportResultUi()) return@post
+                if (fileManagementRefreshToken == refreshToken) {
+                    fileSummaries = summaries
+                    selectedFileFolders.retainAll(fileSummaries.map { it.folderName }.toSet())
+                    renderFileManagementList()
+                }
                 when {
                     result.skippedProtected > 0 -> {
                         Toast.makeText(this, R.string.delete_files_protected, Toast.LENGTH_SHORT).show()
@@ -1525,14 +1527,6 @@ class MainActivity : AppCompatActivity() {
                 refreshExportablePatientFilesAsync()
             }
         }
-    }
-
-    private fun currentProtectedFileFolderName(): String? {
-        if (!isMonitoring) return null
-        activeMonitorFileSession?.recordsFile?.parentFile?.name?.let { return it }
-        val id = currentPatientId()
-        if (id.isEmpty()) return null
-        return patientDataFileStore.patientFolderName(currentPatientNameForFiles(), id)
     }
 
     private fun bindMineRowsFromInfo(patientId: String, info: PatientInfo?) {

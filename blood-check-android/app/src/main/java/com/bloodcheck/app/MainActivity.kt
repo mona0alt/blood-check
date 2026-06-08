@@ -191,6 +191,7 @@ class MainActivity : AppCompatActivity() {
         PatientDataFileStore.fromContext(this)
     }
     private val patientRecordCsvWriter = PatientRecordCsvWriter()
+    private val patientZipExporter = PatientDataZipExporter()
     @Volatile private var activeMonitorFileSession: MonitorFileSession? = null
     @Volatile private var activeMonitorSessionToken: Long = 0L
     @Volatile private var monitorFileWritesDisabled: Boolean = false
@@ -1187,15 +1188,32 @@ class MainActivity : AppCompatActivity() {
         return !m.patientInfo?.get("统一ID").isNullOrBlank()
     }
 
-    private fun hasExportableRecords(): Boolean {
+    private fun currentPatientNameForFiles(): String {
+        return PatientDataStorage.loadLocalCollectProfile(this).name
+    }
+
+    private fun currentPatientDatasetDirectory(patientId: String): File {
+        val activeSession = activeMonitorFileSession
+        val activeDir = activeSession?.recordsFile?.parentFile
+        if (activeSession != null && activeSession.patientId == patientId && activeDir != null) {
+            return activeDir
+        }
+        return patientDataFileStore.patientDirectory(currentPatientNameForFiles(), patientId)
+    }
+
+    private fun hasExportablePatientFiles(): Boolean {
         val id = currentPatientId()
         if (id.isEmpty()) return false
-        return PatientDataStorage.getRecords(this, id).length() > 0
+        val activeSession = activeMonitorFileSession
+        if (activeSession != null && activeSession.patientId == id) return true
+        val patientDir = currentPatientDatasetDirectory(id)
+        return patientDataFileStore.recordsFile(patientDir).isFile ||
+            patientDataFileStore.spectrumFile(patientDir).isFile
     }
 
     private fun updateMonitoringUi() {
         val hasId = hasPatientIdFlag()
-        val hasData = hasExportableRecords()
+        val hasData = hasExportablePatientFiles()
 
         if (isMonitoring && hasId) {
             layoutBottomInput.visibility = View.GONE
@@ -1496,14 +1514,44 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.toast_export_need_id, Toast.LENGTH_SHORT).show()
             return
         }
-        val records = PatientDataStorage.getRecords(this, id)
-        if (records.length() == 0) {
-            Toast.makeText(this, R.string.toast_no_export, Toast.LENGTH_SHORT).show()
-            return
-        }
-        val path = PatientDataExport.exportCsvToDownloadsDir(this, id, records)
-        if (path != null) {
-            showExportSuccessPathDialog(path)
+
+        val exportPatientName = currentPatientNameForFiles()
+        val outputDir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+            ?: filesDir
+        val outputZip = File(
+            outputDir,
+            "患者数据_${PatientDataFileStore.safeName(exportPatientName)}_" +
+                "${PatientDataFileStore.safeName(id)}_${System.currentTimeMillis()}.zip"
+        )
+
+        submitMonitorFileIo(
+            errorMessage = "患者数据导出失败",
+            disableWritesOnFailure = false,
+            skipWhenFileWritesDisabled = false
+        ) {
+            val activeSession = activeMonitorFileSession
+            if (activeSession != null && activeSession.patientId == id) {
+                activeSession.batcher.flush()
+            }
+
+            val activeDir = activeSession?.recordsFile?.parentFile
+            val patientDir = if (activeSession != null && activeSession.patientId == id && activeDir != null) {
+                activeDir
+            } else {
+                patientDataFileStore.patientDirectory(exportPatientName, id)
+            }
+            val result = patientZipExporter.zipDataSet(patientDir, outputZip)
+            handler.post {
+                if (!result.created) {
+                    Toast.makeText(this, R.string.toast_no_patient_files, Toast.LENGTH_SHORT).show()
+                    return@post
+                }
+                showExportSuccessPathDialog(outputZip.absolutePath)
+                if (result.missingFiles.isNotEmpty()) {
+                    Toast.makeText(this, R.string.export_zip_incomplete, Toast.LENGTH_SHORT).show()
+                }
+                updateMonitoringUi()
+            }
         }
     }
 

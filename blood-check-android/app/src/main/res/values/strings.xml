@@ -73,7 +73,9 @@
     <string name="toast_stopped">已停止监测</string>
     <string name="toast_alarm_reset">告警已重置</string>
     <string name="toast_no_export">没有数据可导出</string>
+    <string name="toast_no_patient_files">没有可导出的患者数据文件</string>
     <string name="toast_export_need_id">请先输入患者ID</string>
+    <string name="export_zip_incomplete">部分患者数据文件缺失，已导出现有文件</string>
     <string name="export_success_path">导出成功\n保存位置: %1$s</string>
     <string name="export_success_dialog_title">导出成功</string>
     <string name="export_success_dialog_hint">文件保存路径（可复制）：</string>

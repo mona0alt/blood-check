@@ -4,6 +4,7 @@ import android.content.Intent
 import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.os.Build
+import android.graphics.Typeface
 import android.graphics.PorterDuff
 import android.location.LocationManager
 import android.net.Uri
@@ -15,9 +16,11 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.util.Log
+import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -123,6 +126,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvMineValSpo2: TextView
     private lateinit var tvMineValPao2: TextView
     private lateinit var tvMineValO2hb: TextView
+    private lateinit var tvMineFileCount: TextView
+    private lateinit var btnMineFileRefresh: MaterialButton
+    private lateinit var btnMineFileToggleSelection: MaterialButton
+    private lateinit var btnMineFileDelete: MaterialButton
+    private lateinit var layoutMineFileList: LinearLayout
+    private lateinit var tvMineFileEmpty: TextView
 
     private val handler = Handler(Looper.getMainLooper())
     private val monitorPollRunnable = Runnable {
@@ -199,6 +208,9 @@ class MainActivity : AppCompatActivity() {
     private var hasExportablePatientFilesCache: Boolean = false
     private var exportablePatientFilesCachePatientId: String? = null
     private var exportabilityRefreshToken: Long = 0L
+    private var fileManagementRefreshToken: Long = 0L
+    private var fileSummaries: List<PatientDataSetSummary> = emptyList()
+    private val selectedFileFolders = linkedSetOf<String>()
     private var liveInferenceInFlight: Boolean = false
     private var liveInferenceRequestSequence: Long = 0L
     private var pendingLiveInferenceRequestId: Long? = null
@@ -237,6 +249,10 @@ class MainActivity : AppCompatActivity() {
         btnStopMonitor.setOnClickListener { stopMonitoring() }
         btnExport.setOnClickListener { exportCurrentPatientData() }
         btnResetAlarm.setOnClickListener { resetHbAlarm() }
+        btnMineFileRefresh.setOnClickListener { refreshFileManagementAsync() }
+        btnMineFileToggleSelection.setOnClickListener { toggleFileSelection() }
+        btnMineFileDelete.setOnClickListener { confirmDeleteSelectedFiles() }
+        renderFileManagementList()
 
         viewModel.monitorState.observe(this) { state ->
             when (state) {
@@ -275,6 +291,7 @@ class MainActivity : AppCompatActivity() {
         rootMain.post {
             restoreMonitorStateFromStorage()
             refreshExportablePatientFilesAsync()
+            refreshFileManagementAsync()
             startBleStatusMonitor()
         }
     }
@@ -368,6 +385,12 @@ class MainActivity : AppCompatActivity() {
         tvMineValSpo2 = findViewById(R.id.tvMineValSpo2)
         tvMineValPao2 = findViewById(R.id.tvMineValPao2)
         tvMineValO2hb = findViewById(R.id.tvMineValO2hb)
+        tvMineFileCount = findViewById(R.id.tvMineFileCount)
+        btnMineFileRefresh = findViewById(R.id.btnMineFileRefresh)
+        btnMineFileToggleSelection = findViewById(R.id.btnMineFileToggleSelection)
+        btnMineFileDelete = findViewById(R.id.btnMineFileDelete)
+        layoutMineFileList = findViewById(R.id.layoutMineFileList)
+        tvMineFileEmpty = findViewById(R.id.tvMineFileEmpty)
     }
 
     private fun applyWindowInsets() {
@@ -459,6 +482,7 @@ class MainActivity : AppCompatActivity() {
         liveMonitorGate.reset()
         updateMonitoringUi()
         refreshExportablePatientFilesAsync()
+        refreshFileManagementAsync()
         Toast.makeText(this, R.string.toast_stopped, Toast.LENGTH_SHORT).show()
         startBleStatusMonitor()
     }
@@ -475,6 +499,7 @@ class MainActivity : AppCompatActivity() {
         flushActiveMonitorSpectrumAsync(clearSession = true)
         updateMonitoringUi()
         refreshExportablePatientFilesAsync()
+        refreshFileManagementAsync()
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         handler.removeCallbacks(bleStatusRetryRunnable)
         handler.postDelayed(bleStatusRetryRunnable, BLE_STATUS_RETRY_MILLIS)
@@ -498,6 +523,7 @@ class MainActivity : AppCompatActivity() {
         updateLegendColors()
         monitoringSessionPatientId = null
         refreshExportablePatientFilesAsync()
+        refreshFileManagementAsync()
         runWhenBleReady { startMonitoringInternal(fromAuto = true) }
     }
 
@@ -575,6 +601,7 @@ class MainActivity : AppCompatActivity() {
                     exportablePatientFilesCachePatientId = patientId
                     hasExportablePatientFilesCache = true
                     updateMonitoringUi()
+                    refreshFileManagementAsync()
                     onReady()
                 }
             }
@@ -1308,6 +1335,7 @@ class MainActivity : AppCompatActivity() {
 
         if (!home) {
             refreshMinePage()
+            refreshFileManagementAsync()
         }
     }
 
@@ -1332,6 +1360,179 @@ class MainActivity : AppCompatActivity() {
         layoutMineContent.visibility = View.VISIBLE
         tvMineEmpty.visibility = View.GONE
         bindMineRowsFromInfo(resolvedId, info)
+    }
+
+    private fun refreshFileManagementAsync() {
+        val refreshToken = ++fileManagementRefreshToken
+        submitMonitorFileIo(
+            errorMessage = "患者数据文件列表刷新失败",
+            disableWritesOnFailure = false,
+            skipWhenFileWritesDisabled = false
+        ) {
+            val summaries = patientDataFileStore.listDataSets()
+            handler.post {
+                if (!canShowExportResultUi() || fileManagementRefreshToken != refreshToken) return@post
+                fileSummaries = summaries
+                selectedFileFolders.retainAll(fileSummaries.map { it.folderName }.toSet())
+                renderFileManagementList()
+            }
+        }
+    }
+
+    private fun renderFileManagementList() {
+        tvMineFileCount.text = getString(R.string.mine_file_count, fileSummaries.size)
+        layoutMineFileList.removeAllViews()
+        tvMineFileEmpty.visibility = if (fileSummaries.isEmpty()) View.VISIBLE else View.GONE
+        layoutMineFileList.visibility = if (fileSummaries.isEmpty()) View.GONE else View.VISIBLE
+
+        fileSummaries.forEachIndexed { index, summary ->
+            if (index > 0) {
+                layoutMineFileList.addView(View(this).apply {
+                    setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.uni_border))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        1
+                    )
+                })
+            }
+            layoutMineFileList.addView(createFileSummaryRow(summary))
+        }
+        updateFileActionButtons()
+    }
+
+    private fun createFileSummaryRow(summary: PatientDataSetSummary): View {
+        val primary = ContextCompat.getColor(this, R.color.design_text_primary)
+        val secondary = ContextCompat.getColor(this, R.color.design_text_secondary)
+        val warning = ContextCompat.getColor(this, R.color.design_alarm_orange)
+        val density = resources.displayMetrics.density
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, (10 * density).toInt(), 0, (10 * density).toInt())
+
+            val checkBox = CheckBox(this@MainActivity).apply {
+                isChecked = selectedFileFolders.contains(summary.folderName)
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked) {
+                        selectedFileFolders.add(summary.folderName)
+                    } else {
+                        selectedFileFolders.remove(summary.folderName)
+                    }
+                    updateFileActionButtons()
+                }
+            }
+            addView(checkBox, LinearLayout.LayoutParams(
+                (40 * density).toInt(),
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+
+            val texts = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            val title = TextView(this@MainActivity).apply {
+                text = summary.folderName
+                textSize = 14f
+                setTextColor(primary)
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 2
+            }
+            val detailParts = mutableListOf(
+                "${summary.fileCount} 个文件",
+                PatientFileSizeFormatter.formatBytes(summary.totalBytes)
+            )
+            val detail = TextView(this@MainActivity).apply {
+                text = if (summary.isComplete) {
+                    detailParts.joinToString(" · ")
+                } else {
+                    detailParts.plus(getString(R.string.file_incomplete)).joinToString(" · ")
+                }
+                textSize = 12f
+                setTextColor(if (summary.isComplete) secondary else warning)
+            }
+            texts.addView(title)
+            texts.addView(detail)
+            addView(texts, LinearLayout.LayoutParams(
+                0,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                1f
+            ))
+        }
+    }
+
+    private fun updateFileActionButtons() {
+        val allFolders = fileSummaries.map { it.folderName }.toSet()
+        val hasRows = allFolders.isNotEmpty()
+        val allSelected = hasRows && selectedFileFolders.containsAll(allFolders)
+        btnMineFileToggleSelection.isEnabled = hasRows
+        btnMineFileToggleSelection.text = getString(
+            if (allSelected) R.string.file_action_clear_selection else R.string.file_action_select_all
+        )
+        btnMineFileDelete.isEnabled = selectedFileFolders.isNotEmpty()
+    }
+
+    private fun toggleFileSelection() {
+        val allFolders = fileSummaries.map { it.folderName }
+        if (allFolders.isEmpty()) return
+        if (selectedFileFolders.containsAll(allFolders)) {
+            selectedFileFolders.clear()
+        } else {
+            selectedFileFolders.clear()
+            selectedFileFolders.addAll(allFolders)
+        }
+        renderFileManagementList()
+    }
+
+    private fun confirmDeleteSelectedFiles() {
+        val selected = selectedFileFolders.toList()
+        if (selected.isEmpty()) return
+        MaterialAlertDialogBuilder(this, R.style.ThemeOverlay_BloodCheck_MaterialAlertDialog)
+            .setTitle(R.string.delete_files_title)
+            .setMessage(getString(R.string.delete_files_message, selected.size))
+            .setNegativeButton(R.string.action_cancel, null)
+            .setPositiveButton(R.string.file_action_delete) { _, _ ->
+                deleteSelectedFileFoldersAsync(selected)
+            }
+            .show()
+    }
+
+    private fun deleteSelectedFileFoldersAsync(folderNames: List<String>) {
+        val protectedFolderName = currentProtectedFileFolderName()
+        val refreshToken = ++fileManagementRefreshToken
+        submitMonitorFileIo(
+            errorMessage = "患者数据文件删除失败",
+            disableWritesOnFailure = false,
+            skipWhenFileWritesDisabled = false
+        ) {
+            val result = patientDataFileStore.deleteDataSets(folderNames, protectedFolderName)
+            val summaries = patientDataFileStore.listDataSets()
+            handler.post {
+                if (!canShowExportResultUi() || fileManagementRefreshToken != refreshToken) return@post
+                fileSummaries = summaries
+                selectedFileFolders.retainAll(fileSummaries.map { it.folderName }.toSet())
+                renderFileManagementList()
+                when {
+                    result.skippedProtected > 0 -> {
+                        Toast.makeText(this, R.string.delete_files_protected, Toast.LENGTH_SHORT).show()
+                    }
+                    result.failed > 0 || result.deleted < result.requested -> {
+                        Toast.makeText(this, R.string.delete_files_partial, Toast.LENGTH_SHORT).show()
+                    }
+                    else -> {
+                        Toast.makeText(this, R.string.delete_files_done, Toast.LENGTH_SHORT).show()
+                    }
+                }
+                refreshExportablePatientFilesAsync()
+            }
+        }
+    }
+
+    private fun currentProtectedFileFolderName(): String? {
+        if (!isMonitoring) return null
+        activeMonitorFileSession?.recordsFile?.parentFile?.name?.let { return it }
+        val id = currentPatientId()
+        if (id.isEmpty()) return null
+        return patientDataFileStore.patientFolderName(currentPatientNameForFiles(), id)
     }
 
     private fun bindMineRowsFromInfo(patientId: String, info: PatientInfo?) {
@@ -1500,6 +1701,7 @@ class MainActivity : AppCompatActivity() {
             updateMonitoringUi()
             if (!currentTabHome) {
                 refreshMinePage()
+                refreshFileManagementAsync()
             }
             refreshExportablePatientFilesAsync()
             if (patientChangedDuringMonitoring) {
@@ -1849,6 +2051,20 @@ internal object MonitorFileIoFailurePolicy {
 
     fun shouldShowToast(nowMillis: Long, lastToastMillis: Long): Boolean {
         return lastToastMillis <= 0L || nowMillis - lastToastMillis >= TOAST_BACKOFF_MILLIS
+    }
+}
+
+internal object PatientFileSizeFormatter {
+    fun formatBytes(bytes: Long): String {
+        if (bytes < 1024L) return "${bytes.coerceAtLeast(0L)} B"
+        val units = arrayOf("KB", "MB", "GB")
+        var value = bytes.toDouble() / 1024.0
+        var unitIndex = 0
+        while (value >= 1024.0 && unitIndex < units.lastIndex) {
+            value /= 1024.0
+            unitIndex += 1
+        }
+        return String.format(Locale.US, "%.1f %s", value, units[unitIndex])
     }
 }
 

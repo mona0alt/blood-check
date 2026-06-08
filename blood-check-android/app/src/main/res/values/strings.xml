@@ -56,6 +56,19 @@
     <string name="mine_row_spo2">血氧饱和度：</string>
     <string name="mine_row_pao2">氧分压：</string>
     <string name="mine_row_o2hb">氧合血红蛋白分数：</string>
+    <string name="mine_file_card_title">患者数据文件</string>
+    <string name="mine_file_count">共 %1$d 个数据集</string>
+    <string name="file_action_refresh">刷新</string>
+    <string name="file_action_select_all">全选</string>
+    <string name="file_action_clear_selection">清除</string>
+    <string name="file_action_delete">删除</string>
+    <string name="file_empty">暂无患者数据文件</string>
+    <string name="file_incomplete">文件不完整</string>
+    <string name="delete_files_title">删除数据文件</string>
+    <string name="delete_files_message">确定删除已选择的 %1$d 个数据集吗？</string>
+    <string name="delete_files_done">已删除所选数据集</string>
+    <string name="delete_files_partial">部分数据集未删除</string>
+    <string name="delete_files_protected">正在监测的数据集已跳过</string>
 
     <string name="settings_title">设置</string>
     <string name="settings_section_collection">数据采集周期配置</string>

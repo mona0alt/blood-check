@@ -133,6 +133,14 @@ class PatientDataFilesTest {
     }
 
     @Test
+    fun formatsPatientFileSizesForRows() {
+        assertEquals("0 B", PatientFileSizeFormatter.formatBytes(0))
+        assertEquals("512 B", PatientFileSizeFormatter.formatBytes(512))
+        assertEquals("1.5 KB", PatientFileSizeFormatter.formatBytes(1536))
+        assertEquals("2.0 MB", PatientFileSizeFormatter.formatBytes(2L * 1024L * 1024L))
+    }
+
+    @Test
     fun deletesSelectedPatientDirectoriesButSkipsActivePatient() {
         val root = createTempDir(prefix = "patient-files")
         val store = PatientDataFileStore(root)

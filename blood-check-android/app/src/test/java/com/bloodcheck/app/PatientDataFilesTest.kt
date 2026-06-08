@@ -38,6 +38,24 @@ class PatientDataFilesTest {
     }
 
     @Test
+    fun exportResolverFindsExistingDatasetForPatientIdAfterNameChanges() {
+        val root = createTempDir(prefix = "patient-files")
+        val store = PatientDataFileStore(root)
+        val oldNameDir = store.patientDirectory("旧姓名", "p001")
+        oldNameDir.mkdirs()
+        File(oldNameDir, PatientDataFileStore.RECORDS_FILE).writeText("records")
+
+        val resolved = PatientDatasetDirectoryResolver.resolve(
+            store = store,
+            patientId = "p001",
+            currentPatientName = "新姓名",
+            activeSessionDirectory = null
+        )
+
+        assertEquals(oldNameDir.absolutePath, resolved.absolutePath)
+    }
+
+    @Test
     fun csvMarkerDirectoriesDoNotCountAsPatientFiles() {
         val root = createTempDir(prefix = "patient-files")
         val store = PatientDataFileStore(root)

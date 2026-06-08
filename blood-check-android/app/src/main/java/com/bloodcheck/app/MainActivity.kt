@@ -565,6 +565,7 @@ class MainActivity : AppCompatActivity() {
                     isActiveMonitorSession(patientId, monitorToken) &&
                     activeMonitorFileSession?.monitorToken == monitorToken
                 ) {
+                    updateMonitoringUi()
                     onReady()
                 }
             }
@@ -1195,10 +1196,15 @@ class MainActivity : AppCompatActivity() {
     private fun currentPatientDatasetDirectory(patientId: String): File {
         val activeSession = activeMonitorFileSession
         val activeDir = activeSession?.recordsFile?.parentFile
-        if (activeSession != null && activeSession.patientId == patientId && activeDir != null) {
-            return activeDir
+        val activeSessionDirectory = activeDir.takeIf {
+            activeSession != null && activeSession.patientId == patientId
         }
-        return patientDataFileStore.patientDirectory(currentPatientNameForFiles(), patientId)
+        return PatientDatasetDirectoryResolver.resolve(
+            store = patientDataFileStore,
+            patientId = patientId,
+            currentPatientName = currentPatientNameForFiles(),
+            activeSessionDirectory = activeSessionDirectory
+        )
     }
 
     private fun hasExportablePatientFiles(): Boolean {
@@ -1535,13 +1541,18 @@ class MainActivity : AppCompatActivity() {
             }
 
             val activeDir = activeSession?.recordsFile?.parentFile
-            val patientDir = if (activeSession != null && activeSession.patientId == id && activeDir != null) {
-                activeDir
-            } else {
-                patientDataFileStore.patientDirectory(exportPatientName, id)
+            val activeSessionDirectory = activeDir.takeIf {
+                activeSession != null && activeSession.patientId == id
             }
+            val patientDir = PatientDatasetDirectoryResolver.resolve(
+                store = patientDataFileStore,
+                patientId = id,
+                currentPatientName = exportPatientName,
+                activeSessionDirectory = activeSessionDirectory
+            )
             val result = patientZipExporter.zipDataSet(patientDir, outputZip)
             handler.post {
+                if (!canShowExportResultUi()) return@post
                 if (!result.created) {
                     Toast.makeText(this, R.string.toast_no_patient_files, Toast.LENGTH_SHORT).show()
                     return@post
@@ -1553,6 +1564,10 @@ class MainActivity : AppCompatActivity() {
                 updateMonitoringUi()
             }
         }
+    }
+
+    private fun canShowExportResultUi(): Boolean {
+        return !isFinishing && !isDestroyed
     }
 
     private fun showExportSuccessPathDialog(fullPath: String) {
@@ -1635,6 +1650,30 @@ private data class MonitorFileSession(
     val recordsFile: File,
     val batcher: BleSpectrumBatcher
 )
+
+internal object PatientDatasetDirectoryResolver {
+    fun resolve(
+        store: PatientDataFileStore,
+        patientId: String,
+        currentPatientName: String,
+        activeSessionDirectory: File?
+    ): File {
+        if (activeSessionDirectory != null) return activeSessionDirectory
+
+        val safePatientIdSuffix = "_${PatientDataFileStore.safeName(patientId)}"
+        val matching = store.listDataSets()
+            .filter { summary -> summary.folderName.endsWith(safePatientIdSuffix) }
+
+        val existing = matching
+            .sortedWith(
+                compareByDescending<PatientDataSetSummary> { it.isComplete }
+                    .thenByDescending { it.lastModifiedMillis }
+            )
+            .firstOrNull()
+
+        return existing?.dir ?: store.patientDirectory(currentPatientName, patientId)
+    }
+}
 
 internal object MonitorSpectrumFileIndex {
     fun nextSampleIndex(spectrumFile: File): Long {

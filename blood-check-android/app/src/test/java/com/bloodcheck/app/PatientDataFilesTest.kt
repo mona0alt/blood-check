@@ -56,6 +56,47 @@ class PatientDataFilesTest {
     }
 
     @Test
+    fun exportResolverDoesNotMatchLongerPatientIdWithSameSuffix() {
+        val root = createTempDir(prefix = "patient-files")
+        val store = PatientDataFileStore(root)
+        val wrongDir = store.patientDirectory("患者", "abc_001")
+        wrongDir.mkdirs()
+        File(wrongDir, PatientDataFileStore.RECORDS_FILE).writeText("wrong")
+        val fallback = store.patientDirectory("新姓名", "001")
+
+        val resolved = PatientDatasetDirectoryResolver.resolve(
+            store = store,
+            patientId = "001",
+            currentPatientName = "新姓名",
+            activeSessionDirectory = null
+        )
+
+        assertEquals(fallback.absolutePath, resolved.absolutePath)
+    }
+
+    @Test
+    fun exportResolverPrefersActualDataFilesOverNewerMarkerOnlyDirectory() {
+        val root = createTempDir(prefix = "patient-files")
+        val store = PatientDataFileStore(root)
+        val dataDir = store.patientDirectory("旧姓名", "p001")
+        dataDir.mkdirs()
+        File(dataDir, PatientDataFileStore.RECORDS_FILE).writeText("records")
+        val markerDir = store.patientDirectory("新姓名", "p001")
+        markerDir.mkdirs()
+        File(markerDir, PatientDataFileStore.RECORDS_FILE).mkdir()
+        markerDir.setLastModified(dataDir.lastModified() + 10_000L)
+
+        val resolved = PatientDatasetDirectoryResolver.resolve(
+            store = store,
+            patientId = "p001",
+            currentPatientName = "新姓名",
+            activeSessionDirectory = null
+        )
+
+        assertEquals(dataDir.absolutePath, resolved.absolutePath)
+    }
+
+    @Test
     fun csvMarkerDirectoriesDoNotCountAsPatientFiles() {
         val root = createTempDir(prefix = "patient-files")
         val store = PatientDataFileStore(root)

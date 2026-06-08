@@ -196,6 +196,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var activeMonitorSessionToken: Long = 0L
     @Volatile private var monitorFileWritesDisabled: Boolean = false
     @Volatile private var lastMonitorFileIoToastAtMillis: Long = 0L
+    private var hasExportablePatientFilesCache: Boolean = false
+    private var exportablePatientFilesCachePatientId: String? = null
+    private var exportabilityRefreshToken: Long = 0L
     private var liveInferenceInFlight: Boolean = false
     private var liveInferenceRequestSequence: Long = 0L
     private var pendingLiveInferenceRequestId: Long? = null
@@ -271,6 +274,7 @@ class MainActivity : AppCompatActivity() {
 
         rootMain.post {
             restoreMonitorStateFromStorage()
+            refreshExportablePatientFilesAsync()
             startBleStatusMonitor()
         }
     }
@@ -454,6 +458,7 @@ class MainActivity : AppCompatActivity() {
         flushActiveMonitorSpectrumAsync(clearSession = true)
         liveMonitorGate.reset()
         updateMonitoringUi()
+        refreshExportablePatientFilesAsync()
         Toast.makeText(this, R.string.toast_stopped, Toast.LENGTH_SHORT).show()
         startBleStatusMonitor()
     }
@@ -469,6 +474,7 @@ class MainActivity : AppCompatActivity() {
         clearLiveInferenceState()
         flushActiveMonitorSpectrumAsync(clearSession = true)
         updateMonitoringUi()
+        refreshExportablePatientFilesAsync()
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         handler.removeCallbacks(bleStatusRetryRunnable)
         handler.postDelayed(bleStatusRetryRunnable, BLE_STATUS_RETRY_MILLIS)
@@ -491,6 +497,7 @@ class MainActivity : AppCompatActivity() {
         refreshChart()
         updateLegendColors()
         monitoringSessionPatientId = null
+        refreshExportablePatientFilesAsync()
         runWhenBleReady { startMonitoringInternal(fromAuto = true) }
     }
 
@@ -565,6 +572,8 @@ class MainActivity : AppCompatActivity() {
                     isActiveMonitorSession(patientId, monitorToken) &&
                     activeMonitorFileSession?.monitorToken == monitorToken
                 ) {
+                    exportablePatientFilesCachePatientId = patientId
+                    hasExportablePatientFilesCache = true
                     updateMonitoringUi()
                     onReady()
                 }
@@ -1193,28 +1202,51 @@ class MainActivity : AppCompatActivity() {
         return PatientDataStorage.loadLocalCollectProfile(this).name
     }
 
-    private fun currentPatientDatasetDirectory(patientId: String): File {
-        val activeSession = activeMonitorFileSession
-        val activeDir = activeSession?.recordsFile?.parentFile
-        val activeSessionDirectory = activeDir.takeIf {
-            activeSession != null && activeSession.patientId == patientId
-        }
-        return PatientDatasetDirectoryResolver.resolve(
-            store = patientDataFileStore,
-            patientId = patientId,
-            currentPatientName = currentPatientNameForFiles(),
-            activeSessionDirectory = activeSessionDirectory
-        )
-    }
-
     private fun hasExportablePatientFiles(): Boolean {
         val id = currentPatientId()
         if (id.isEmpty()) return false
         val activeSession = activeMonitorFileSession
         if (activeSession != null && activeSession.patientId == id) return true
-        val patientDir = currentPatientDatasetDirectory(id)
-        return patientDataFileStore.recordsFile(patientDir).isFile ||
-            patientDataFileStore.spectrumFile(patientDir).isFile
+        return exportablePatientFilesCachePatientId == id && hasExportablePatientFilesCache
+    }
+
+    private fun refreshExportablePatientFilesAsync() {
+        val id = currentPatientId()
+        if (id.isEmpty()) {
+            exportabilityRefreshToken += 1L
+            exportablePatientFilesCachePatientId = null
+            hasExportablePatientFilesCache = false
+            updateMonitoringUi()
+            return
+        }
+        val patientName = currentPatientNameForFiles()
+        val refreshToken = ++exportabilityRefreshToken
+        submitMonitorFileIo(
+            errorMessage = "患者数据文件状态检查失败",
+            disableWritesOnFailure = false,
+            skipWhenFileWritesDisabled = false
+        ) {
+            val activeSession = activeMonitorFileSession
+            val activeDir = activeSession?.recordsFile?.parentFile
+            val activeSessionDirectory = activeDir.takeIf {
+                activeSession != null && activeSession.patientId == id
+            }
+            val patientDir = PatientDatasetDirectoryResolver.resolve(
+                store = patientDataFileStore,
+                patientId = id,
+                currentPatientName = patientName,
+                activeSessionDirectory = activeSessionDirectory
+            )
+            val hasFiles = patientDataFileStore.recordsFile(patientDir).isFile ||
+                patientDataFileStore.spectrumFile(patientDir).isFile
+            handler.post {
+                if (canShowExportResultUi() && currentPatientId() == id && exportabilityRefreshToken == refreshToken) {
+                    exportablePatientFilesCachePatientId = id
+                    hasExportablePatientFilesCache = hasFiles
+                    updateMonitoringUi()
+                }
+            }
+        }
     }
 
     private fun updateMonitoringUi() {
@@ -1469,6 +1501,7 @@ class MainActivity : AppCompatActivity() {
             if (!currentTabHome) {
                 refreshMinePage()
             }
+            refreshExportablePatientFilesAsync()
             if (patientChangedDuringMonitoring) {
                 restartMonitoringForPatientChange()
             }
@@ -1561,7 +1594,7 @@ class MainActivity : AppCompatActivity() {
                 if (result.missingFiles.isNotEmpty()) {
                     Toast.makeText(this, R.string.export_zip_incomplete, Toast.LENGTH_SHORT).show()
                 }
-                updateMonitoringUi()
+                refreshExportablePatientFilesAsync()
             }
         }
     }
@@ -1660,9 +1693,20 @@ internal object PatientDatasetDirectoryResolver {
     ): File {
         if (activeSessionDirectory != null) return activeSessionDirectory
 
+        val fallback = store.patientDirectory(currentPatientName, patientId)
+        val summaries = store.listDataSets()
+        val exactCurrent = summaries.firstOrNull { summary -> summary.folderName == fallback.name }
+        if (exactCurrent != null && exactCurrent.hasActualDataFiles()) {
+            return exactCurrent.dir
+        }
+
         val safePatientIdSuffix = "_${PatientDataFileStore.safeName(patientId)}"
-        val matching = store.listDataSets()
-            .filter { summary -> summary.folderName.endsWith(safePatientIdSuffix) }
+        val matching = summaries
+            .filter { summary ->
+                summary.hasActualDataFiles() &&
+                    summary.folderName != fallback.name &&
+                    matchesHistoricalPatientId(summary.folderName, safePatientIdSuffix)
+            }
 
         val existing = matching
             .sortedWith(
@@ -1671,7 +1715,17 @@ internal object PatientDatasetDirectoryResolver {
             )
             .firstOrNull()
 
-        return existing?.dir ?: store.patientDirectory(currentPatientName, patientId)
+        return existing?.dir ?: fallback
+    }
+
+    private fun PatientDataSetSummary.hasActualDataFiles(): Boolean {
+        return hasRecords || hasSpectrum
+    }
+
+    private fun matchesHistoricalPatientId(folderName: String, safePatientIdSuffix: String): Boolean {
+        if (!folderName.endsWith(safePatientIdSuffix)) return false
+        val namePrefix = folderName.removeSuffix(safePatientIdSuffix)
+        return namePrefix.isNotBlank() && !namePrefix.contains("_")
     }
 }
 

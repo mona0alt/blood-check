@@ -3,6 +3,7 @@ package com.bloodcheck.app
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
@@ -115,6 +116,13 @@ class SpectrumCsvWriter {
 
 class PatientDataZipExporter {
     fun zipDataSet(patientDir: File, outputZip: File): PatientZipResult {
+        outputZip.parentFile?.mkdirs()
+        FileOutputStream(outputZip).use { output ->
+            return zipDataSet(patientDir, output)
+        }
+    }
+
+    fun zipDataSet(patientDir: File, output: OutputStream): PatientZipResult {
         val expected = listOf(PatientDataFileStore.RECORDS_FILE, PatientDataFileStore.SPECTRUM_FILE)
         val existing = expected
             .map { File(patientDir, it) }
@@ -128,8 +136,7 @@ class PatientDataZipExporter {
             )
         }
 
-        outputZip.parentFile?.mkdirs()
-        ZipOutputStream(FileOutputStream(outputZip)).use { zip ->
+        ZipOutputStream(output).use { zip ->
             existing.forEach { file ->
                 zip.putNextEntry(ZipEntry(file.name))
                 file.inputStream().use { input -> input.copyTo(zip) }

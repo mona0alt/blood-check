@@ -49,7 +49,6 @@ import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
-import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
     companion object {
@@ -90,7 +89,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvDataLac: TextView
     private lateinit var tvDataPi: TextView
     private lateinit var tvDataSpo2: TextView
-    private lateinit var tvDataPao2: TextView
     private lateinit var tvDataHr: TextView
     private lateinit var tvDataFo2Hb: TextView
     private lateinit var tvDataGlucose: TextView
@@ -124,12 +122,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvMineValTemp: TextView
     private lateinit var tvMineValHr: TextView
     private lateinit var tvMineValSpo2: TextView
-    private lateinit var tvMineValPao2: TextView
     private lateinit var tvMineValO2hb: TextView
     private lateinit var tvMineFileCount: TextView
     private lateinit var btnMineFileRefresh: MaterialButton
-    private lateinit var btnMineFileToggleSelection: MaterialButton
     private lateinit var btnMineFileDelete: MaterialButton
+    private lateinit var btnMineFileExport: MaterialButton
     private lateinit var layoutMineFileList: LinearLayout
     private lateinit var tvMineFileEmpty: TextView
 
@@ -250,8 +247,8 @@ class MainActivity : AppCompatActivity() {
         btnExport.setOnClickListener { exportCurrentPatientData() }
         btnResetAlarm.setOnClickListener { resetHbAlarm() }
         btnMineFileRefresh.setOnClickListener { refreshFileManagementAsync() }
-        btnMineFileToggleSelection.setOnClickListener { toggleFileSelection() }
         btnMineFileDelete.setOnClickListener { confirmDeleteSelectedFiles() }
+        btnMineFileExport.setOnClickListener { exportSelectedFileFolder() }
         renderFileManagementList()
 
         viewModel.monitorState.observe(this) { state ->
@@ -349,7 +346,6 @@ class MainActivity : AppCompatActivity() {
         tvDataLac = findViewById(R.id.tvDataLac)
         tvDataPi = findViewById(R.id.tvDataPi)
         tvDataSpo2 = findViewById(R.id.tvDataSpo2)
-        tvDataPao2 = findViewById(R.id.tvDataPao2)
         tvDataHr = findViewById(R.id.tvDataHr)
         tvDataFo2Hb = findViewById(R.id.tvDataFo2Hb)
         tvDataGlucose = findViewById(R.id.tvDataGlucose)
@@ -383,12 +379,11 @@ class MainActivity : AppCompatActivity() {
         tvMineValTemp = findViewById(R.id.tvMineValTemp)
         tvMineValHr = findViewById(R.id.tvMineValHr)
         tvMineValSpo2 = findViewById(R.id.tvMineValSpo2)
-        tvMineValPao2 = findViewById(R.id.tvMineValPao2)
         tvMineValO2hb = findViewById(R.id.tvMineValO2hb)
         tvMineFileCount = findViewById(R.id.tvMineFileCount)
         btnMineFileRefresh = findViewById(R.id.btnMineFileRefresh)
-        btnMineFileToggleSelection = findViewById(R.id.btnMineFileToggleSelection)
         btnMineFileDelete = findViewById(R.id.btnMineFileDelete)
+        btnMineFileExport = findViewById(R.id.btnMineFileExport)
         layoutMineFileList = findViewById(R.id.layoutMineFileList)
         tvMineFileEmpty = findViewById(R.id.tvMineFileEmpty)
     }
@@ -1019,7 +1014,6 @@ class MainActivity : AppCompatActivity() {
         tvDataLac.text = "--"
         tvDataPi.text = "--"
         tvDataSpo2.text = "--"
-        tvDataPao2.text = ""
         tvDataHr.text = "--"
         tvDataFo2Hb.text = "--"
         tvDataGlucose.text = "--"
@@ -1069,13 +1063,6 @@ class MainActivity : AppCompatActivity() {
             "${info?.get("血氧饱和度")}%"
         } else {
             "--"
-        }
-
-        val pao2Raw = info?.get("氧分压")?.trim().orEmpty()
-        tvDataPao2.text = if (pao2Raw.isNotBlank()) {
-            "${pao2DisplayInt(pao2Raw)}mmHg"
-        } else {
-            ""
         }
 
         tvDataHr.text = if (!info?.get("心率").isNullOrBlank()) {
@@ -1461,26 +1448,44 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateFileActionButtons() {
-        val allFolders = fileSummaries.map { it.folderName }.toSet()
-        val hasRows = allFolders.isNotEmpty()
-        val allSelected = hasRows && selectedFileFolders.containsAll(allFolders)
-        btnMineFileToggleSelection.isEnabled = hasRows
-        btnMineFileToggleSelection.text = getString(
-            if (allSelected) R.string.file_action_clear_selection else R.string.file_action_select_all
-        )
-        btnMineFileDelete.isEnabled = selectedFileFolders.isNotEmpty()
+        val state = MineFileActionPolicy.state(selectedFileFolders.size)
+        btnMineFileDelete.isEnabled = state.canDelete
+        btnMineFileExport.isEnabled = state.canExport
     }
 
-    private fun toggleFileSelection() {
-        val allFolders = fileSummaries.map { it.folderName }
-        if (allFolders.isEmpty()) return
-        if (selectedFileFolders.containsAll(allFolders)) {
-            selectedFileFolders.clear()
-        } else {
-            selectedFileFolders.clear()
-            selectedFileFolders.addAll(allFolders)
+    private fun exportSelectedFileFolder() {
+        val selectedFolder = selectedFileFolders.singleOrNull() ?: return
+        val summary = fileSummaries.firstOrNull { it.folderName == selectedFolder } ?: return
+        val outputDir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+            ?: filesDir
+        val outputZip = File(
+            outputDir,
+            "患者数据_${PatientDataFileStore.safeName(summary.folderName)}_" +
+                "${System.currentTimeMillis()}.zip"
+        )
+
+        submitMonitorFileIo(
+            errorMessage = "患者数据导出失败",
+            disableWritesOnFailure = false,
+            skipWhenFileWritesDisabled = false
+        ) {
+            val activeSession = activeMonitorFileSession
+            if (activeSession?.recordsFile?.parentFile?.name == summary.folderName) {
+                activeSession.batcher.flush()
+            }
+            val result = patientZipExporter.zipDataSet(summary.dir, outputZip)
+            handler.post {
+                if (!canShowExportResultUi()) return@post
+                if (!result.created) {
+                    Toast.makeText(this, R.string.toast_no_patient_files, Toast.LENGTH_SHORT).show()
+                    return@post
+                }
+                showExportSuccessPathDialog(outputZip.absolutePath)
+                if (result.missingFiles.isNotEmpty()) {
+                    Toast.makeText(this, R.string.export_zip_incomplete, Toast.LENGTH_SHORT).show()
+                }
+            }
         }
-        renderFileManagementList()
     }
 
     private fun confirmDeleteSelectedFiles() {
@@ -1547,8 +1552,6 @@ class MainActivity : AppCompatActivity() {
         tvMineValHr.text = if (hr.isNotBlank()) "${hr}次/分" else "--"
         val spo2 = merged?.get("血氧饱和度").orEmpty()
         tvMineValSpo2.text = if (spo2.isNotBlank()) "${spo2}%" else "--"
-        val pao2 = merged?.get("氧分压").orEmpty()
-        tvMineValPao2.text = if (pao2.isNotBlank()) "${pao2DisplayInt(pao2)}mmHg" else ""
         val o2 = merged?.get("氧合血红蛋白分数").orEmpty()
             .ifBlank { merged?.get("氧合血红蛋白分数(FO2Hb)").orEmpty() }
         tvMineValO2hb.text = if (o2.isNotBlank()) "${o2}%" else "--"
@@ -1851,14 +1854,6 @@ class MainActivity : AppCompatActivity() {
         val number = value.toDoubleOrNull()
         val display = number?.let { formatDoubleSmart(it) } ?: value
         return "$display$unit"
-    }
-
-    /** PaO2（氧分压）展示为整数 */
-    private fun pao2DisplayInt(raw: String): String {
-        val t = raw.trim()
-        if (t.isEmpty()) return ""
-        val d = t.toDoubleOrNull() ?: return t
-        return d.roundToInt().toString()
     }
 
     private fun syncPatientIdToLocalProfile(patientId: String) {

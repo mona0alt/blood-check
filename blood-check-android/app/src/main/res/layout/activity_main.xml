@@ -599,18 +599,6 @@
 
                             <TextView
                                 style="@style/MineInfoRowLabel"
-                                android:text="@string/mine_row_pao2" />
-
-                            <TextView
-                                android:id="@+id/tvMineValPao2"
-                                style="@style/MineInfoRowValue" />
-                        </LinearLayout>
-
-                        <LinearLayout
-                            style="@style/MineInfoRowContainer">
-
-                            <TextView
-                                style="@style/MineInfoRowLabel"
                                 android:text="@string/mine_row_o2hb" />
 
                             <TextView
@@ -687,7 +675,7 @@
                             app:strokeWidth="1dp" />
 
                         <com.google.android.material.button.MaterialButton
-                            android:id="@+id/btnMineFileToggleSelection"
+                            android:id="@+id/btnMineFileExport"
                             style="?attr/materialButtonOutlinedStyle"
                             android:layout_width="0dp"
                             android:layout_height="40dp"
@@ -696,7 +684,7 @@
                             android:insetTop="0dp"
                             android:insetBottom="0dp"
                             android:minWidth="0dp"
-                            android:text="@string/file_action_select_all"
+                            android:text="@string/file_action_export"
                             android:textAllCaps="false"
                             android:textColor="@color/design_primary_teal"
                             app:strokeColor="@color/design_primary_teal"

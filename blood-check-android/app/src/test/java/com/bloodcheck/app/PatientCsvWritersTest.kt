@@ -8,7 +8,9 @@ import org.junit.Test
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.io.ByteArrayOutputStream
 import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
 
 class PatientCsvWritersTest {
     @Test
@@ -103,6 +105,22 @@ class PatientCsvWritersTest {
     }
 
     @Test
+    fun zipExportCanWriteToOutputStream() {
+        val dir = tempDir("patient-zip-stream")
+        File(dir, PatientDataFileStore.RECORDS_FILE).writeText("records")
+        File(dir, PatientDataFileStore.SPECTRUM_FILE).writeText("spectrum")
+        val out = ByteArrayOutputStream()
+
+        val result = PatientDataZipExporter().zipDataSet(dir, out)
+
+        assertTrue(result.created)
+        assertEquals(
+            listOf(PatientDataFileStore.RECORDS_FILE, PatientDataFileStore.SPECTRUM_FILE),
+            zipEntryNames(out.toByteArray())
+        )
+    }
+
+    @Test
     fun zipExportReportsMissingFilesWhenNoDatasetFilesExist() {
         val dir = tempDir("patient-zip-empty")
         val zip = File(tempDir("patient-zip-out"), "out.zip")
@@ -136,4 +154,16 @@ class PatientCsvWritersTest {
     }
 
     private fun tempDir(prefix: String): File = Files.createTempDirectory(prefix).toFile()
+
+    private fun zipEntryNames(bytes: ByteArray): List<String> {
+        val names = mutableListOf<String>()
+        ZipInputStream(bytes.inputStream()).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                names += entry.name
+                zip.closeEntry()
+            }
+        }
+        return names
+    }
 }

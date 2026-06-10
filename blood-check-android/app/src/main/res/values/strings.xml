@@ -59,8 +59,7 @@
     <string name="mine_file_card_title">患者数据文件</string>
     <string name="mine_file_count">共 %1$d 个数据集</string>
     <string name="file_action_refresh">刷新</string>
-    <string name="file_action_select_all">全选</string>
-    <string name="file_action_clear_selection">清除</string>
+    <string name="file_action_export">导出</string>
     <string name="file_action_delete">删除</string>
     <string name="file_empty">暂无患者数据文件</string>
     <string name="file_incomplete">文件不完整</string>

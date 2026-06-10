@@ -23,6 +23,20 @@ data class PatientDataDeleteResult(
     val skippedProtected: Int
 )
 
+data class MineFileActionState(
+    val canDelete: Boolean,
+    val canExport: Boolean
+)
+
+object MineFileActionPolicy {
+    fun state(selectedCount: Int): MineFileActionState {
+        return MineFileActionState(
+            canDelete = selectedCount > 0,
+            canExport = selectedCount == 1
+        )
+    }
+}
+
 class PatientDataFileStore(private val rootDir: File) {
     companion object {
         const val RECORDS_FILE = "records.csv"
